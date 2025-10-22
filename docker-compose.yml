@@ -1,0 +1,15 @@
+services:
+  bowling:
+    image: python:3.11-slim
+    container_name: bowling
+    working_dir: /app
+    command: >
+      bash -lc "pip install flask==3.0.3 gunicorn==21.2.0 &&
+                gunicorn -w 2 -b 0.0.0.0:8000 app:app"
+    ports:
+      - "8080:8000"
+    volumes:
+      - /mnt/Acer_Drive/Applications/Bowling:/app
+    environment:
+      - TZ=America/Los_Angeles
+    restart: unless-stopped

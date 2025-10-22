@@ -1,0 +1,12 @@
+body { background: #f8fafc; }
+.card { border-radius: 1rem; }
+.navbar-brand { letter-spacing: .2px; }
+#scoresWrap .form-control { text-align: center; padding-right: .25rem; }
+#scoresWrap .col { position: relative; }
+#scoresWrap .col::after{ content: attr(data-idx); position:absolute; top:.35rem; left:.5rem; font-size:.75rem; color:#98a2b3; }
+.table th { font-weight: 600; }
+footer hr { opacity: .15; }
+#totalsBlock .badge { font-size: .85rem; padding:.5em .65em; }
+#totalsBlock .table-striped tbody tr:nth-of-type(odd) { --bs-table-accent-bg: rgba(0,0,0,.02); }
+#totalsBlock .fw-semibold { letter-spacing:.2px; }
+#totalsBlock .text-secondary { color: #5f6b7a!important; }
