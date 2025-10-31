@@ -1,195 +1,133 @@
 <!doctype html>
-<html lang="en" data-bs-theme="light">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bowling Tracker · Flask + SQLite</title>
+  <title>Bowling Tracker</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <style>.tab-pane { padding-top: 1rem; }</style>
 </head>
-<body>
-  <nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm">
-    <div class="container">
-      <a class="navbar-brand fw-semibold" href="#">🎳 Bowling Tracker</a>
-      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMain" aria-controls="navMain" aria-expanded="false" aria-label="Toggle navigation">
-        <span class="navbar-toggler-icon"></span>
-      </button>
-      <div class="collapse navbar-collapse" id="navMain">
-        <ul class="navbar-nav ms-auto">
-          <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#entry">New Session</a></li>
-          <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#sessions">Sessions</a></li>
-          <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#totals">Totals</a></li>
-        </ul>
+<body class="bg-light">
+<div class="container py-4">
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 mb-0">Bowling Tracker <span id="year" class="text-secondary"></span></h1>
+    <div id="likesTotalHost"></div>
+  </div>
+
+  <!-- New Session (Front page ONLY) -->
+  <div id="entry" class="card mb-4">
+    <div class="card-header">New Session</div>
+    <div class="card-body">
+      <div class="row g-3 align-items-end">
+        <div class="col-md-4">
+          <label class="form-label">Bowler</label>
+          <input id="bowlerInput" list="bowlersList" class="form-control" placeholder="Start typing a name">
+          <datalist id="bowlersList"></datalist>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label">Alley</label>
+          <select id="alley" class="form-select"></select>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label">Date</label>
+          <input id="date" type="date" class="form-control">
+        </div>
+        <div class="col-md-2 text-end">
+          <button id="save" class="btn btn-primary w-100">Save</button>
+          <button id="clear" class="btn btn-outline-secondary w-100 mt-2">Clear</button>
+        </div>
+      </div>
+      <hr>
+      <div class="d-flex align-items-center justify-content-between">
+        <label class="form-label mb-0">Scores (max 12)</label>
+        <button id="addGame" type="button" class="btn btn-sm btn-outline-primary">+ Add Game</button>
+      </div>
+      <div id="scoresWrap" class="row row-cols-2 row-cols-md-6 g-2 mt-2"></div>
+      <div id="liveStats" class="mt-3 text-secondary small"></div>
+    </div>
+  </div>
+
+  <!-- Tabs for Sessions / Totals / Honor Roll -->
+  <ul class="nav nav-tabs" id="mainTabs" role="tablist">
+    <li class="nav-item" role="presentation">
+      <button class="nav-link active" id="sessions-tab" data-bs-toggle="tab" data-bs-target="#sessions-pane" type="button" role="tab" aria-controls="sessions-pane" aria-selected="true">Sessions</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" id="totals-tab" data-bs-toggle="tab" data-bs-target="#totals-pane" type="button" role="tab" aria-controls="totals-pane" aria-selected="false">Totals</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" id="honor-tab" data-bs-toggle="tab" data-bs-target="#honor-pane" type="button" role="tab" aria-controls="honor-pane" aria-selected="false">Honor Roll</button>
+    </li>
+  </ul>
+  <div class="tab-content">
+    <div class="tab-pane fade show active" id="sessions-pane" role="tabpanel" aria-labelledby="sessions-tab">
+      <div class="card mt-3">
+        <div class="card-header">Sessions</div>
+        <div class="card-body" id="sessionsTable">Loading…</div>
       </div>
     </div>
-  </nav>
-
-  <main class="container my-4">
-    <div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mb-3">
-      <div>
-        <h1 class="h3 mb-1">Bowling Tracker</h1>
-        <p class="text-secondary mb-0">Log games, review sessions, and track BIX & monthly averages.</p>
+    <div class="tab-pane fade" id="totals-pane" role="tabpanel" aria-labelledby="totals-tab">
+      <div class="card mt-3">
+        <div class="card-header">Totals</div>
+        <div class="card-body" id="totalsBlock">Loading…</div>
       </div>
-      <div class="text-end small text-muted">Flask + SQLite · Bootstrap 5</div>
     </div>
-
-    <ul class="nav nav-pills bg-body-tertiary rounded p-1 mb-3" id="tabs" role="tablist">
-      <li class="nav-item" role="presentation">
-        <button class="nav-link active" id="entry-tab" data-bs-toggle="tab" data-bs-target="#entry" type="button" role="tab">New Session</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="sessions-tab" data-bs-toggle="tab" data-bs-target="#sessions" type="button" role="tab">Sessions</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="totals-tab" data-bs-toggle="tab" data-bs-target="#totals" type="button" role="tab">Totals</button>
-      </li>
-    </ul>
-
-    <div class="tab-content pt-2">
-      <!-- New Session -->
-      <section class="tab-pane fade show active" id="entry" role="tabpanel" aria-labelledby="entry-tab">
-        <div class="card shadow-sm border-0">
-          <div class="card-body p-4">
-            <div class="d-flex align-items-center justify-content-between mb-3">
-              <div>
-                <h2 class="h5 mb-1">Enter Session</h2>
-                <div class="text-secondary small">Type to search bowlers · Default alleys set for Medina / Rajan / Baule</div>
-              </div>
-              <div id="liveStats" class="text-end small text-secondary"></div>
-            </div>
-
-            <div class="row g-3">
-              <div class="col-md-4">
-                <div class="form-floating">
-                  <input id="bowlerInput" class="form-control" list="bowlersList" placeholder="Start typing a bowler name">
-                  <label for="bowlerInput">Bowler</label>
-                  <datalist id="bowlersList"></datalist>
-                </div>
-              </div>
-              <div class="col-md-4">
-                <div class="form-floating d-flex gap-2">
-                  <select id="alley" class="form-select" aria-label="Select alley" required></select>
-                  <button id="addAlley" class="btn btn-outline-secondary flex-shrink-0" type="button" title="Add alley">
-                    Add
-                  </button>
-                </div>
-                <div class="mt-2">
-                  <input id="newAlley" class="form-control" placeholder="Type new alley name to add">
-                </div>
-              </div>
-              <div class="col-md-4">
-                <div class="form-floating">
-                  <input id="date" type="date" class="form-control" aria-label="Session date" required>
-                  <label for="date">Date</label>
-                </div>
-              </div>
-            </div>
-
-            <hr class="my-4">
-
-            <div class="d-flex align-items-center justify-content-between mb-2">
-              <label class="form-label mb-0">Scores</label>
-              <div class="d-flex align-items-center gap-2">
-                <span class="badge rounded-pill text-bg-light"><span id="scoreCount">0</span>/12</span>
-                <button class="btn btn-outline-primary btn-sm" id="addScoreBtn" type="button">Add Game</button>
-                <button class="btn btn-outline-secondary btn-sm" id="clearScoresBtn" type="button">Clear Scores</button>
-              </div>
-            </div>
-
-            <div id="scoresWrap" class="scores-wrap row row-cols-2 row-cols-sm-3 row-cols-md-6 g-2"></div>
-
-            <div class="d-flex gap-2 mt-4">
-              <button id="save" class="btn btn-primary">Save Session</button>
-              <button id="clear" class="btn btn-outline-secondary">Reset Form</button>
-            </div>
-
-            <div id="lookupDiag" class="small text-secondary mt-3"></div>
-          </div>
-        </div>
-      </section>
-
-      <section class="mt-3" id="entrySessionSection" style="display:none;">
-        <div class="card border-0 shadow-sm">
-          <div class="card-body">
-            <div class="d-flex align-items-center justify-content-between mb-2">
-              <h3 class="h6 mb-0">Current Session</h3>
-              <div class="small text-secondary" id="entrySessionMeta"></div>
-            </div>
-            <div class="table-responsive">
-              <table class="table table-sm align-middle mb-2">
-                <thead><tr><th>#</th><th class="text-end">Score</th></tr></thead>
-                <tbody id="entrySessionGames"></tbody>
-              </table>
-            </div>
-            <div class="d-flex gap-2">
-              <button class="btn btn-outline-secondary btn-sm" id="entryAddGameBtn">Add Game</button>
-              <button class="btn btn-success btn-sm" id="entrySaveGamesBtn">Save Changes</button>
-            </div>
-            <div id="entrySaveMsg" class="mt-2"></div>
-          </div>
-        </div>
-      </section>
-
-
-      <!-- Sessions -->
-      <section class="tab-pane fade" id="sessions" role="tabpanel" aria-labelledby="sessions-tab">
-        <div class="card shadow-sm border-0">
-          <div class="card-body">
-            <div class="d-flex align-items-center justify-content-between mb-2">
-              <h2 class="h5 mb-0">Sessions</h2>
-              <div class="text-secondary small">Newest first</div>
-            </div>
-            <div class="table-responsive" id="sessionsTable"></div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Totals -->
-      <section class="tab-pane fade" id="totals" role="tabpanel" aria-labelledby="totals-tab">
-        <div class="card shadow-sm border-0">
-          <div class="card-body">
-            <div class="d-flex align-items-center justify-content-between mb-2">
-              <h2 class="h5 mb-0">Totals</h2>
-              <div class="text-secondary small">BIX, high games, averages</div>
-            </div>
-            <div id="totalsBlock"></div>
-          </div>
-        </div>
-      </section>
-    </div>
-  </main>
-
-  <!-- Modal -->
-  <div class="modal fade" id="sessionModal" tabindex="-1" aria-labelledby="sessionModalLabel" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-centered">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title" id="sessionModalLabel">Session</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-        </div>
-        <div class="modal-body">
-          <div class="small text-secondary mb-2" id="sessionMeta"></div>
-          <div class="table-responsive">
-            <table class="table table-sm align-middle mb-0">
-              <thead><tr><th>Game #</th><th class="text-end">Score</th></tr></thead>
-              <tbody id="sessionGamesTbody"></tbody>
-            </table>
-          </div>
-        </div>
-        <div id="editControls" class="d-flex flex-wrap gap-2 ms-3 mb-2"></div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-        </div>
+    <div class="tab-pane fade" id="honor-pane" role="tabpanel" aria-labelledby="honor-tab">
+      <div class="card mt-3">
+        <div class="card-header">Honor Roll</div>
+        <div class="card-body" id="honorRollBlock">Loading…</div>
       </div>
     </div>
   </div>
 
-  <footer class="container py-4 text-center text-secondary small">
-    <hr><div>© <span id="year"></span> Bowling Tracker</div>
-  </footer>
+</div>
 
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-  <script>document.addEventListener('DOMContentLoaded',()=>{document.getElementById('year').textContent=new Date().getFullYear();});</script>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+<!-- Session Modal -->
+<div class="modal fade" id="sessionModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="sessionMeta">Session</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="sessionStats" class="mb-3"></div>
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th class="text-end">Score</th>
+                <th class="text-end">Like</th>
+              </tr>
+            </thead>
+            <tbody id="sessionGamesTbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="/static/app.js"></script>
+<script src="/static/app.addgame.js"></script>
+<script>
+// Lazy render on tab change (works with your existing app.js functions)
+document.addEventListener("DOMContentLoaded", () => {
+  const tabs = document.querySelectorAll('button[data-bs-toggle="tab"]');
+  tabs.forEach(tab => {
+    tab.addEventListener('shown.bs.tab', async (e) => {
+      const id = e.target.id;
+      try {
+        if (id === 'sessions-tab' && typeof renderSessions === 'function') await renderSessions();
+        if (id === 'totals-tab' && typeof renderTotals === 'function') await renderTotals();
+        if (id === 'honor-tab' && typeof renderHonorRoll === 'function') await renderHonorRoll();
+      } catch (err) { console.error(err); }
+    });
+  });
+});
+</script>
 </body>
 </html>

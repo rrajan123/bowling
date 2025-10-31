@@ -1,358 +1,392 @@
 // ---------- utilities ----------
-async function fetchJSON(url, opts={}){
-  const res = await fetch(url, {headers: {"Content-Type":"application/json"}, ...opts});
-  if (!res.ok) throw new Error(await res.text());
-  return await res.json();
+function apiUrl(path){
+  const base = window.location.origin;
+  if (!path.startsWith("/")) path = "/" + path;
+  return base + path;
 }
-function msg(html, type="info"){ return `<div class="alert alert-${type} mt-2">${html}</div>`; }
+async function fetchJSON(url, opts = {}) {
+  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opts });
+  const text = await res.text();
+  if (!res.ok) {
+    try {
+      const j = JSON.parse(text);
+      throw new Error(j.error || text || (res.status + ' ' + res.statusText));
+    } catch {
+      throw new Error(text || (res.status + ' ' + res.statusText));
+    }
+  }
+  try { return JSON.parse(text); } catch { return {}; }
+}
+function msg(html, type = "info") { return `<div class="alert alert-${type} mt-2">${html}</div>`; }
+function setHTML(id, html) { const el = document.getElementById(id); if (el) el.innerHTML = html; return !!el; }
+function getEl(id) { return document.getElementById(id); }
+
+// Keep track of current session shown in modal
+let CURRENT_SESSION_ID = null;
 
 // ---------- lookups ----------
-async function loadLookups(){
-  const data = await fetchJSON("/api/lookups");
-
-  // populate alley select
-  const aSel = document.getElementById("alley");
-  aSel.innerHTML = data.alleys.map(a=>`<option value="${a.id}">${a.name}</option>`).join("");
-
-  // populate bowlers datalist
-  const bList = document.getElementById("bowlersList");
-  bList.innerHTML = data.bowlers.map(b=>`<option data-id="${b.id}" value="${b.name}"></option>`).join("");
-
-  // simple diagnostics if empty
-  const diag = document.getElementById("lookupDiag");
-  const aCount = data.alleys.length, bCount = data.bowlers.length;
-  diag.textContent = `Loaded ${bCount} bowlers, ${aCount} alleys.`;
+async function loadLookups() {
+  try {
+    const data = await fetchJSON("/api/lookups");
+    const aSel = getEl("alley");
+    if (aSel) aSel.innerHTML = data.alleys.map(a => `<option value="${a.id}">${a.name}</option>`).join("");
+    const bList = getEl("bowlersList");
+    if (bList) bList.innerHTML = data.bowlers.map(b => `<option data-id="${b.id}" value="${b.name}"></option>`).join("");
+  } catch (e) {
+    console.error("loadLookups failed:", e);
+  }
 }
 
-// ---------- defaults mapping ----------
-function setDefaultAlleyForBowler(name){
+// ---------- defaults ----------
+function setDefaultAlleyForBowler(name) {
   if (!name) return;
-  const alleySel = document.getElementById("alley");
+  const alleySel = getEl("alley");
+  if (!alleySel) return;
   const opts = Array.from(alleySel.options);
   const lower = name.toLowerCase();
-
   let target = null;
-  if (lower.includes("medina")) target = "Milwaukie Lanes";
-  else if (lower.includes("rajan") || lower.includes("baule")) target = "Zodos Lanes";
-
+  if (lower.includes("medina")) target = "Milwaukie Bowl";
+  else if (lower.includes("rjb")) target = "Milwaukie Bowl";
+  else if (lower.includes("rajan") || lower.includes("baule") || lower.includes("barsotti")) target = "Zodos Lanes";
   if (!target) return;
-  let found = opts.find(o => o.text.toLowerCase() === target.toLowerCase());
-  if (!found && target.toLowerCase().startsWith("milwaukie")){
-    found = opts.find(o => o.text.toLowerCase().startsWith("milwaukie"));
-  }
+  const found = opts.find(o => o.text.toLowerCase() === target.toLowerCase());
   if (found) alleySel.value = found.value;
 }
 
-// ---------- scores helpers ----------
-function updateLiveStats(){
+// ---------- scores ----------
+function updateLiveStats() {
   const scores = getCurrentScores();
   const count = scores.length;
-  const avg = count ? (scores.reduce((a,b)=>a+b,0)/count) : 0;
-  document.getElementById('scoreCount').textContent = count;
-  const el = document.getElementById('liveStats');
-  el.innerHTML = `<span class="stat">Games: <strong>${count}</strong></span><span class="stat"> Avg: <strong>${avg.toFixed(2)}</strong></span>`;
+  const avg = count ? (scores.reduce((a, b) => a + b, 0) / count) : 0;
+  const cntEl = getEl("scoreCount");
+  if (cntEl) cntEl.textContent = count;
+  const el = getEl("liveStats");
+  if (el) el.innerHTML = `<span>Games: <strong>${count}</strong></span> <span>Avg: <strong>${avg.toFixed(2)}</strong></span>`;
 }
-function addScoreInput(initValue=""){
-  const wrap = document.getElementById('scoresWrap');
+function addScoreInput(initValue = "") {
+  const wrap = getEl("scoresWrap");
+  if (!wrap) return;
   const idx = wrap.children.length + 1;
-  if (idx>12) return;
-  const col = document.createElement('div');
-  col.className = 'col';
-  col.setAttribute('data-idx', idx);
-  col.innerHTML = `<input class="form-control game" inputmode="numeric" placeholder="${idx}" type="number" min="1" max="300" value="${initValue}">`;
+  if (idx > 12) return;
+  const col = document.createElement("div");
+  col.className = "col";
+  col.innerHTML = `<input class="form-control game" placeholder="${idx}" type="number" min="1" max="300" value="${initValue}">`;
   wrap.appendChild(col);
 }
-function buildScoreInputs(initialCount=4){
-  const wrap = document.getElementById('scoresWrap'); wrap.innerHTML = '';
-  for (let i=0;i<initialCount;i++) addScoreInput();
+function buildScoreInputs(initialCount = 4) {
+  const wrap = getEl("scoresWrap");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (let i = 0; i < initialCount; i++) addScoreInput();
   updateLiveStats();
 }
-function getCurrentScores(){
-  return Array.from(document.querySelectorAll('#scoresWrap .game'))
-      .map(el => el.value ? parseInt(el.value,10) : null)
-      .filter(v => v!==null);
+function getCurrentScores() {
+  const inputs = document.querySelectorAll("#scoresWrap .game");
+  return Array.from(inputs)
+    .map(el => (el.value ? parseInt(el.value, 10) : null))
+    .filter(v => v !== null);
 }
-function setTodayIfEmpty(){
-  const d = document.getElementById("date");
-  if (!d.value){
-    const t = new Date();
-    const m = String(t.getMonth()+1).padStart(2,'0');
-    const day = String(t.getDate()).padStart(2,'0');
-    d.value = `${t.getFullYear()}-${m}-${day}`;
-  }
+function setTodayIfEmpty() {
+  const d = getEl("date");
+  if (!d || d.value) return;
+  const t = new Date();
+  const m = String(t.getMonth() + 1).padStart(2, "0");
+  const day = String(t.getDate()).padStart(2, "0");
+  d.value = `${t.getFullYear()}-${m}-${day}`;
 }
 
-// ---------- save session ----------
-function findBowlerIdByNameInput(nameTyped){
+// ---------- Save Session ----------
+function findBowlerIdByNameInput(nameTyped) {
   const options = Array.from(document.querySelectorAll("#bowlersList option"));
-  // exact (case-insensitive)
-  let opt = options.find(o => o.value.toLowerCase() === nameTyped.toLowerCase());
-  if (opt) return parseInt(opt.getAttribute("data-id"), 10);
-  // prefix (case-insensitive)
-  opt = options.find(o => o.value.toLowerCase().startsWith(nameTyped.toLowerCase()));
-  if (opt) return parseInt(opt.getAttribute("data-id"), 10);
-  return null;
+  if (!options.length) return null;
+  const opt =
+    options.find(o => o.value.toLowerCase() === nameTyped.toLowerCase()) ||
+    options.find(o => o.value.toLowerCase().startsWith(nameTyped.toLowerCase()));
+  return opt ? parseInt(opt.getAttribute("data-id"), 10) : null;
 }
 
-async function saveSession(){
-  const bowlerInput = document.getElementById("bowlerInput");
-  const alleySel  = document.getElementById("alley");
-  const dateEl    = document.getElementById("date");
-
-  const nameTyped = bowlerInput.value.trim();
+async function saveSession() {
+  const nameTyped = (getEl("bowlerInput")?.value || "").trim();
   const bowler_id = findBowlerIdByNameInput(nameTyped);
-
-  const alley_id  = alleySel && alleySel.value !== "" ? parseInt(alleySel.value,10) : null;
-  const date      = dateEl ? dateEl.value : "";
+  const alley_id = parseInt(getEl("alley")?.value || 0);
+  const date = getEl("date")?.value || "";
   const scores = getCurrentScores();
+  const out = document.querySelector("#entry .card-body") || document.body;
 
-  const out = document.querySelector("#entry .card-body");
-  if (bowler_id===null) { out.insertAdjacentHTML("beforeend", msg("Pick a bowler from the list (start typing to search).","danger")); return; }
-  if (alley_id===null || !date) { out.insertAdjacentHTML("beforeend", msg("Choose an alley and a date.","danger")); return; }
-  if (scores.length===0) { out.insertAdjacentHTML("beforeend", msg("Enter at least one score","danger")); return; }
-  if (scores.length>12)  { out.insertAdjacentHTML("beforeend", msg("Max 12 games per session","danger")); return; }
-  if (scores.some(x=>Number.isNaN(x) || x<1 || x>300)) { out.insertAdjacentHTML("beforeend", msg("Scores must be 1–300","danger")); return; }
+  if (!bowler_id) return out.insertAdjacentHTML("beforeend", msg("Select a bowler.", "danger"));
+  if (!alley_id || !date) return out.insertAdjacentHTML("beforeend", msg("Select alley and date.", "danger"));
+  if (!scores.length) return out.insertAdjacentHTML("beforeend", msg("Enter at least one score.", "danger"));
+  if (scores.length > 12 || scores.some(x => x < 1 || x > 300))
+    return out.insertAdjacentHTML("beforeend", msg("Scores must be 1–300 (max 12).", "danger"));
 
-  try{
-    const resp = await fetchJSON("/api/session", {method:"POST", body: JSON.stringify({bowler_id, alley_id, session_date: date, scores})});
-    out.insertAdjacentHTML("beforeend", msg("Session saved — see Current Session below.","success"));
-    await renderSessions(); await renderTotals();
-    if (resp && resp.session_id){ await showEntrySession(resp.session_id); }
-  }catch(e){
-    let txt = e.message || "";
-    try {
-      const j = JSON.parse(txt);
-      if (j && j.session_id) {
-        out.insertAdjacentHTML("beforeend", msg(
-          `A session already exists for this bowler at this alley on that date. ` +
-          `<a href="#" onclick="showSessionGames(${j.session_id});return false;">Click here to edit that session</a>.`,
-          "warning"
-        ));
-        return;
-      }
-    } catch(_) {}
-    out.insertAdjacentHTML("beforeend", msg("Save failed: "+txt, "danger"));
+  try {
+    await fetchJSON("/api/session", {
+      method: "POST",
+      body: JSON.stringify({ bowler_id, alley_id, session_date: date, scores }),
+    });
+    out.insertAdjacentHTML("beforeend", msg("Session saved.", "success"));
+    await renderSessions();
+    await renderTotals();
+    await renderHonorRoll();
+    await renderLikesTotal();
+  } catch (e) {
+    out.insertAdjacentHTML("beforeend", msg("Save failed: " + e.message, "danger"));
   }
 }
 
-// ---------- sessions (table) ----------
-async function renderSessions(){
-  const rows = await fetchJSON("/api/sessions");
-  const el = document.getElementById("sessionsTable");
-  if (rows.length===0){ el.innerHTML = msg("No sessions yet.","secondary"); return; }
-  let html = `<table class="table table-sm align-middle"><thead><tr><th>Date</th><th>Bowler</th><th>Alley</th><th class="text-end">Games</th></tr></thead><tbody>`;
-  for (const r of rows){
-    html += `<tr><td>${r.session_date}</td><td>${r.bowler}</td><td>${r.alley}</td>` +
-            `<td class="text-end"><a href="#" class="link-primary text-decoration-none" onclick="return showSessionGames(${r.id});">${r.games}</a></td></tr>`;
-  }
-  html += `</tbody></table>`;
-  el.innerHTML = html;
-}
-
-// ---------- session modal (view + edit) ----------
-let __currentSession = null;
-function buildGameInputsFromList(list){
-  const tbody = document.getElementById('sessionGamesTbody');
-  tbody.innerHTML = '';
-  for (let i=0;i<list.length;i++){
-    const num = i+1;
-    const val = list[i];
-    tbody.innerHTML += `<tr>
-      <td>${num}</td>
-      <td class="text-end"><input type="number" class="form-control form-control-sm text-end game-edit" min="1" max="300" value="${val}"></td>
-    </tr>`;
-  }
-}
-function readGameInputs(){
-  return Array.from(document.querySelectorAll('#sessionGamesTbody .game-edit'))
-    .map(el => el.value ? parseInt(el.value,10) : null)
-    .filter(v => v!==null);
-}
-function enterEditMode(scores){
-  const ctrls = document.getElementById('editControls');
-  ctrls.innerHTML = `
-    <button class="btn btn-outline-secondary btn-sm" id="addGameBtn">Add Game</button>
-    <button class="btn btn-success btn-sm" id="saveGamesBtn">Save Changes</button>
-  `;
-  buildGameInputsFromList(scores);
-  document.getElementById('addGameBtn').onclick = () => {
-    const curr = readGameInputs();
-    if (curr.length >= 12) return;
-    curr.push("");
-	 
-    buildGameInputsFromList(curr);
-  };
-  document.getElementById('saveGamesBtn').onclick = async () => {
-    const curr = readGameInputs();
-    if (curr.length === 0){ alert('Enter at least one score'); return; }
-    if (curr.length > 12){ alert('Max 12 games'); return; }
-    if (curr.some(x => Number.isNaN(x) || x<1 || x>300)){ alert('Scores must be 1–300'); return; }
-    try {
-      await fetchJSON(`/api/session/${__currentSession}/games`, {method:'PUT', body: JSON.stringify({scores: curr})});
-      await renderSessions(); await renderTotals();
-      showSessionGames(__currentSession);
-    } catch(e){
-      alert('Save failed: ' + e.message);
+// ---------- Sessions ----------
+async function renderSessions() {
+  try {
+    const rows = await fetchJSON("/api/sessions");
+    const el = getEl("sessionsTable");
+    if (!el) return; // container missing — skip silently
+    if (!rows.length) {
+      el.innerHTML = msg("No sessions yet.", "secondary");
+      return;
     }
-  };
+    let html = `<table class="table table-sm align-middle">
+      <thead>
+        <tr><th>Date</th><th>Bowler</th><th>Alley</th><th class="text-end">Games</th><th class="text-end">Avg</th></tr>
+      </thead><tbody>`;
+    for (const r of rows) {
+      const avg = r.session_avg == null ? "—" : Number(r.session_avg).toFixed(2);
+      html += `<tr>
+        <td>${r.session_date}</td>
+        <td>${r.bowler}</td>
+        <td>${r.alley}</td>
+        <td class="text-end"><a href="#" onclick="return showSessionGames(${r.id});">${r.games}</a></td>
+        <td class="text-end">${avg}</td>
+      </tr>`;
+    }
+    html += "</tbody></table>";
+    el.innerHTML = html;
+  } catch (e) {
+    console.error("renderSessions failed:", e);
+    setHTML("sessionsTable", msg("Failed to load sessions.", "danger"));
+  }
 }
-async function showSessionGames(sid){
-  try{
+
+// ---------- Session Modal + Likes ----------
+async function showSessionGames(sid) {
+  try {
     const data = await fetchJSON(`/api/session/${sid}/games`);
-    __currentSession = sid;
-    const meta = `${data.bowler} · ${data.alley} · ${data.session_date}`;
-    document.getElementById('sessionMeta').textContent = meta;
-    const tbody = document.getElementById('sessionGamesTbody');
-    tbody.innerHTML = '';
-    for (const g of data.games){
-      tbody.innerHTML += `<tr><td>${g.game_number}</td><td class="text-end">${g.score}</td></tr>`;
+    CURRENT_SESSION_ID = sid;
+    const metaEl = getEl("sessionMeta");
+    if (metaEl) metaEl.textContent = `${data.bowler} · ${data.alley} · ${data.session_date}`;
+
+    const statsHost = getEl("sessionStats");
+    if (statsHost) {
+      statsHost.innerHTML = `
+        <div class="row text-center mb-3">
+          <div class="col"><strong>Avg:</strong> ${data.stats.avg ?? "—"}</div>
+          <div class="col"><strong>Low:</strong> ${data.stats.low ?? "—"}</div>
+          <div class="col"><strong>High:</strong> ${data.stats.high ?? "—"}</div>
+        </div>`;
     }
-    const ctrls = document.getElementById('editControls');
-    ctrls.innerHTML = `<button class="btn btn-primary btn-sm" id="editGamesBtn">Edit</button>`;
-    document.getElementById('editGamesBtn').onclick = () => {
-      const scores = data.games.map(g => g.score);
-      enterEditMode(scores);
-    };
-    const modalEl = document.getElementById('sessionModal');
-    const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
-    modal.show();
-  }catch(e){
-    alert('Failed to load session: ' + e.message);
+
+    const tbody = getEl("sessionGamesTbody");
+    if (tbody) {
+      tbody.innerHTML = "";
+      data.games.forEach(g => {
+        const likeBtnId = `like-btn-${g.id ?? 'sid'+sid+'-gn'+g.game_number}`;
+        const likeCountId = `like-count-${g.id ?? 'sid'+sid+'-gn'+g.game_number}`;
+        const gidAttr = (typeof g.id === "number" && g.id > 0) ? g.id : "";
+        tbody.innerHTML += `
+          <tr data-gn="${g.game_number}">
+            <td>${g.game_number}</td>
+            <td class="text-end">${g.score}</td>
+            <td class="text-end">
+              <button id="${likeBtnId}" class="btn btn-sm btn-outline-primary" onclick="return likeGameSmart('${gidAttr}', ${sid}, ${g.game_number});">
+                👍 Like
+              </button>
+              <span class="ms-2 small text-secondary" id="${likeCountId}">${g.like_count ?? 0}</span>
+            </td>
+          </tr>`;
+      });
+    }
+
+    const modalEl = getEl("sessionModal");
+    if (modalEl && window.bootstrap) {
+      const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+      modal.show();
+    }
+  } catch (e) {
+    console.error("showSessionGames failed:", e);
+    alert("Failed to load session.");
   }
   return false;
 }
 
-
-// ---------- entry-session inline editor ----------
-let __entrySessionId = null;
-function renderEntryGames(scores){
-  const tbody = document.getElementById('entrySessionGames');
-  tbody.innerHTML = '';
-  for (let i=0;i<scores.length;i++){
-    const n = i+1, val = scores[i];
-    tbody.innerHTML += `<tr>
-      <td class="text-secondary">${n}</td>
-      <td class="text-end" style="width:140px">
-        <input type="number" class="form-control form-control-sm text-end entry-game" min="1" max="300" value="${val}">
-      </td>
-    </tr>`;
-  }
-}
-function readEntryGames(){
-  return Array.from(document.querySelectorAll('#entrySessionGames .entry-game'))
-    .map(el => el.value ? parseInt(el.value,10) : null)
-    .filter(v => v!==null);
-}
-async function showEntrySession(sid){
-  const sec = document.getElementById('entrySessionSection');
-  const meta = document.getElementById('entrySessionMeta');
-  const data = await fetchJSON(`/api/session/${sid}/games`);
-  __entrySessionId = sid;
-  meta.textContent = `${data.bowler} · ${data.alley} · ${data.session_date}`;
-  renderEntryGames(data.games.map(g=>g.score));
-  sec.style.display = '';
-}
-function wireEntrySessionButtons(){
-  const addBtn = document.getElementById('entryAddGameBtn');
-  const saveBtn = document.getElementById('entrySaveGamesBtn');
-  const msgEl = document.getElementById('entrySaveMsg');
-  addBtn.onclick = () => {
-    const curr = readEntryGames();
-    if (curr.length >= 12) return;
-    curr.push("");
-	
-    renderEntryGames(curr);
-  };
-  saveBtn.onclick = async () => {
-    const curr = readEntryGames();
-    if (curr.length===0){ msgEl.innerHTML = msg('Enter at least one score', 'danger'); return; }
-    if (curr.length>12){ msgEl.innerHTML = msg('Max 12 games', 'danger'); return; }
-    if (curr.some(x=>Number.isNaN(x)||x<1||x>300)){ msgEl.innerHTML = msg('Scores must be 1–300', 'danger'); return; }
-    try{
-      await fetchJSON(`/api/session/${__entrySessionId}/games`, {method:'PUT', body: JSON.stringify({scores: curr})});
-      msgEl.innerHTML = msg('Saved!', 'success');
-      await renderTotals();
-      await renderSessions();
-    }catch(e){
-      msgEl.innerHTML = msg('Save failed: ' + e.message, 'danger');
-    }
-  };
-}
-
-// ---------- totals ----------
-async function renderTotals(){
-  const data = await fetchJSON("/api/totals");
-  const el = document.getElementById("totalsBlock");
-  if (!data || !data.totals || data.totals.length===0){
-    el.innerHTML = msg("No data yet.","secondary"); return;
-  }
-  let html = "";
-  for (const t of data.totals){
-    const isGroupA = t.bix_group === "A";
-    const badge = `<span class="badge rounded-pill text-bg-primary ms-2">${t.bix.toFixed(2)}</span>`;
-    const line = isGroupA
-      ? `Games: <strong>${t.games}</strong> &nbsp; Avg: <strong>${t.avg.toFixed(2)}</strong> &nbsp; 200+ games: <strong>${t.c200||0}</strong> &nbsp; 210+: <strong>${t.c210||0}</strong> &nbsp; BIX: ${badge}`
-      : `Games: <strong>${t.games}</strong> &nbsp; Avg: <strong>${t.avg.toFixed(2)}</strong> &nbsp; 150+ games: <strong>${t.c150||0}</strong> &nbsp; BIX: ${badge}`;
-    html += `<div class="mb-4">
-      <div class="fw-semibold fs-5 mb-1">${t.name}</div>
-      <div class="mb-3 text-secondary">${line}</div>`;
-    if (t.alleys && t.alleys.length){
-      html += `<div class="table-responsive"><table class="table table-sm table-striped align-middle">
-        <thead><tr><th>Alley</th><th class="text-end">Avg</th><th class="text-end">Games</th></tr></thead><tbody>`;
-      for (const a of t.alleys){
-        html += `<tr><td>${a.alley}</td><td class="text-end">${(a.avg ?? 0).toFixed(2)}</td><td class="text-end">${a.games}</td></tr>`;
-      }
-      html += `</tbody></table></div>`;
-    } else {
-      html += `<div class="text-secondary small">No alley breakdown yet.</div>`;
-    }
-    html += `</div>`;
-  }
-  if (data.bix_message){
-    html += `<div class="alert alert-info mt-2"><strong>BIX Difference:</strong> ${data.bix_message}</div>`;
-  }
-  const months = new Set([...(Object.keys(data.monthly_avgs.Rajan||{})), ...(Object.keys(data.monthly_avgs.Medina||{}))]);
-  const monthList = Array.from(months).sort().reverse();
-  if (monthList.length){
-    html += `<div class="mt-4"><h6 class="mb-2">Monthly Averages (Rajan vs Medina)</h6>
-      <div class="table-responsive"><table class="table table-sm align-middle">
-      <thead><tr><th>Month</th><th class="text-end">Rajan Avg</th><th class="text-end">Medina Avg</th></tr></thead><tbody>`;
-    for (const ym of monthList){
-      const r = data.monthly_avgs.Rajan?.[ym]; const m = data.monthly_avgs.Medina?.[ym];
-      html += `<tr><td>${ym}</td><td class="text-end">${r!=null? r.toFixed(2):"—"}</td><td class="text-end">${m!=null? m.toFixed(2):"—"}</td></tr>`;
-    }
-    html += `</tbody></table></div></div>`;
-  }
-  el.innerHTML = html;
-}
-
-// ---------- alley add ----------
-async function addAlley(){
-  const name = document.getElementById("newAlley").value.trim();
-  if (!name) return;
+async function likeGameSmart(gameIdStr, sessionId, gameNumber) {
+  // First try by game id if valid
+  const gid = parseInt(gameIdStr, 10);
   try {
-    const row = await fetchJSON("/api/alleys", {method:"POST", body: JSON.stringify({name})});
-    const aSel = document.getElementById("alley");
-    const opt = document.createElement("option"); opt.value = row.id; opt.textContent = row.name;
-    aSel.appendChild(opt); document.getElementById("newAlley").value = "";
-  } catch(e){ alert("Add alley failed: " + e.message); }
+    if (Number.isInteger(gid) && gid > 0) {
+      const res = await fetchJSON(apiUrl(`/api/game/${gid}/like`), { method: "POST" });
+      const cntEl = document.getElementById(`like-count-${gid}`) || document.getElementById(`like-count-sid${sessionId}-gn${gameNumber}`);
+      if (cntEl) cntEl.textContent = res.likes;
+      await renderLikesTotal();
+      return false;
+    }
+    // Fallback to session/game_number route
+    const res = await fetchJSON(apiUrl(`/api/session/${sessionId}/game/${gameNumber}/like`), { method: "POST" });
+    const key = `sid${sessionId}-gn${gameNumber}`;
+    const cntEl = document.getElementById(`like-count-${res.game_id}`) || document.getElementById(`like-count-${key}`);
+    if (cntEl) cntEl.textContent = res.likes;
+    await renderLikesTotal();
+    return false;
+  } catch (e) {
+    console.error("likeGameSmart failed:", e);
+    alert("Failed to like this game: " + e.message);
+    return false;
+  }
 }
 
-// ---------- boot ----------
+// ---------- Totals ----------
+async function renderTotals() {
+  try {
+    const data = await fetchJSON("/api/totals");
+    const el = document.getElementById("totalsBlock");
+    if (!el) return;
+
+    if (!data.totals || !data.totals.length) {
+      el.innerHTML = `<div class="alert alert-secondary mt-2">No data yet.</div>`;
+      return;
+    }
+
+    let html = "";
+    for (const t of data.totals) {
+      const badge = `<span class="badge bg-primary ms-2">${t.bix.toFixed(2)}</span>`;
+      const line =
+        t.bix_group === "A"
+          ? `Games: ${t.games} · Avg: ${t.avg.toFixed(2)} · 200+: ${t.c200} · 210+: ${t.c210} ${badge}`
+          : `Games: ${t.games} · Avg: ${t.avg.toFixed(2)} · 150+: ${t.c150} ${badge}`;
+
+      html += `<div class="mb-4">
+        <h5 class="mb-1 d-flex align-items-center justify-content-between">
+          <span>${t.name}</span>
+          <span class="badge bg-success" title="Total likes for ${t.name}">Likes: ${t.likes ?? 0}</span>
+        </h5>
+        <div class="text-secondary mb-2">${line}</div>`;
+
+      // Header row for Alleys + Likes badge shown just above the table
+      html += `<div class="d-flex justify-content-between align-items-center mt-2 mb-1">
+        <span class="text-secondary">Alleys</span>
+        <span class="badge bg-success" title="Total likes for ${t.name}">Likes: ${t.likes ?? 0}</span>
+      </div>`;
+
+      // Alleys table
+      if (t.alleys?.length) {
+        html += `<div class="table-responsive"><table class="table table-sm table-striped align-middle">
+          <thead><tr><th>Alley</th><th class="text-end">Avg</th><th class="text-end">Games</th></tr></thead><tbody>`;
+        t.alleys.forEach(a => {
+          html += `<tr><td>${a.alley}</td><td class="text-end">${(a.avg ?? 0).toFixed(2)}</td><td class="text-end">${a.games}</td></tr>`;
+        });
+        html += `</tbody></table></div>`;
+      } else {
+        html += `<div class="text-secondary">No alley breakdown yet.</div>`;
+      }
+
+      html += `</div>`;
+    }
+
+    if (data.bix_message) html += `<div class="alert alert-info">${data.bix_message}</div>`;
+    el.innerHTML = html;
+  } catch (e) {
+    console.error("renderTotals failed:", e);
+    const el = document.getElementById("totalsBlock");
+    if (el) el.innerHTML = `<div class="alert alert-danger">Failed to load totals.</div>`;
+  }
+}
+
+// ---------- Honor Roll ----------
+async function renderHonorRoll() {
+  try {
+    const el = getEl("honorRollBlock");
+    if (!el) return; // container missing — skip
+    const data = await fetchJSON("/api/honor-roll");
+    const wk = data.week.range.join("–");
+    const mo = data.month.range.join("–");
+    const yearTop = data.year.top_score
+      ? `${data.year.top_score.score} — ${data.year.top_score.bowler} (${data.year.top_score.session_date} @ ${data.year.top_score.alley})`
+      : "No scores yet.";
+
+    el.innerHTML = `
+      <h4>Honor Roll</h4>
+      <div class="row g-3">
+        <div class="col-md-6">
+          <div class="card"><div class="card-header">Top Scores — Week (${wk})</div>
+          <div class="card-body">
+            ${data.week.top_scores.map(r => `${r.score} — ${r.bowler} <span class="text-secondary">(${r.session_date} @ ${r.alley})</span>`).join("<br>") || "No scores."}
+          </div></div>
+        </div>
+        <div class="col-md-6">
+          <div class="card"><div class="card-header">Top Scores — Month (${mo})</div>
+          <div class="card-body">
+            ${data.month.top_scores.map(r => `${r.score} — ${r.bowler} <span class="text-secondary">(${r.session_date} @ ${r.alley})</span>`).join("<br>") || "No scores."}
+          </div></div>
+        </div>
+        <div class="col-md-6">
+          <div class="card"><div class="card-header">Top Avg — Week</div>
+          <div class="card-body">
+            ${data.week.top_avgs.map(r => `${r.avg.toFixed(2)} — ${r.bowler} <span class="text-secondary">(${r.games} games)</span>`).join("<br>") || "No data."}
+          </div></div>
+        </div>
+        <div class="col-md-6">
+          <div class="card"><div class="card-header">Top Avg — Month</div>
+          <div class="card-body">
+            ${data.month.top_avgs.map(r => `${r.avg.toFixed(2)} — ${r.bowler} <span class="text-secondary">(${r.games} games)</span>`).join("<br>") || "No data."}
+          </div></div>
+        </div>
+        <div class="col-md-6">
+          <div class="card"><div class="card-header">Top Score — Year</div>
+          <div class="card-body">${yearTop}</div></div>
+        </div>
+      </div>`;
+  } catch (e) {
+    console.error("renderHonorRoll failed:", e);
+    setHTML("honorRollBlock", msg("Failed to load honor roll.", "danger"));
+  }
+}
+
+// ---------- Likes Total Badge (optional) ----------
+async function renderLikesTotal() {
+  try {
+    const host = getEl("likesTotalHost");
+    const badge = getEl("likesTotalBadge");
+    if (!host && !badge) return; // no placeholder in DOM
+    const data = await fetchJSON("/api/likes/total");
+    if (badge) badge.textContent = data.total_likes;
+    else if (host) host.innerHTML = `Total Likes <span class="badge bg-success ms-2" id="likesTotalBadge">${data.total_likes}</span>`;
+  } catch (e) {
+    console.error("renderLikesTotal failed:", e);
+  }
+}
+
+// ---------- Boot ----------
 document.addEventListener("DOMContentLoaded", async () => {
-  buildScoreInputs(4); await loadLookups(); setTodayIfEmpty();
-  await renderSessions(); await renderTotals();
-
-  // Default alley on bowler typing or change
-  document.getElementById("bowlerInput").addEventListener("input", (e)=> setDefaultAlleyForBowler(e.target.value));
-  document.getElementById("bowlerInput").addEventListener("change", (e)=> setDefaultAlleyForBowler(e.target.value));
-
-  document.getElementById("save").addEventListener("click", saveSession);
-  document.getElementById("clear").addEventListener("click", () => buildScoreInputs(4));
-  document.getElementById("addAlley").addEventListener("click", addAlley);
-  document.getElementById("addScoreBtn").addEventListener("click", () => addScoreInput());
-  document.getElementById("clearScoresBtn").addEventListener("click", () => buildScoreInputs(4));
-  document.getElementById("scoresWrap").addEventListener("input", (e)=>{ if(e.target.classList.contains("game")) updateLiveStats(); });
-  document.getElementById('year').textContent = new Date().getFullYear();
-  wireEntrySessionButtons();
+  try {
+    buildScoreInputs(4);
+    await loadLookups();
+    setTodayIfEmpty();
+    await renderSessions();
+    await renderTotals();
+    await renderHonorRoll();
+    await renderLikesTotal();
+  } catch (e) {
+    console.error("DOMContentLoaded pipeline error:", e);
+  } finally {
+    const bi = getEl("bowlerInput");
+    if (bi) {
+      bi.addEventListener("input", e => setDefaultAlleyForBowler(e.target.value));
+      bi.addEventListener("change", e => setDefaultAlleyForBowler(e.target.value));
+    }
+    getEl("save")?.addEventListener("click", saveSession);
+    getEl("clear")?.addEventListener("click", () => buildScoreInputs(4));
+    getEl("scoresWrap")?.addEventListener("input", e => {
+      if (e.target.classList.contains("game")) updateLiveStats();
+    });
+    const yr = getEl("year");
+    if (yr) yr.textContent = new Date().getFullYear();
+  }
 });
