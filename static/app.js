@@ -20,6 +20,7 @@ async function fetchJSON(url, opts = {}) {
 function msg(html, type = "info") { return `<div class="alert alert-${type} mt-2">${html}</div>`; }
 function setHTML(id, html) { const el = document.getElementById(id); if (el) el.innerHTML = html; return !!el; }
 function getEl(id) { return document.getElementById(id); }
+function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 
 // Keep track of current session shown in modal
 let CURRENT_SESSION_ID = null;
@@ -134,12 +135,12 @@ async function saveSession() {
   }
 }
 
-// ---------- Sessions ----------
+// ---------- Sessions (list) ----------
 async function renderSessions() {
   try {
     const rows = await fetchJSON("/api/sessions");
     const el = getEl("sessionsTable");
-    if (!el) return; // container missing — skip silently
+    if (!el) return;
     if (!rows.length) {
       el.innerHTML = msg("No sessions yet.", "secondary");
       return;
@@ -166,43 +167,86 @@ async function renderSessions() {
   }
 }
 
-// ---------- Session Modal + Likes ----------
+// ---------- Session Modal (detail, likes, comments, add game) ----------
 async function showSessionGames(sid) {
   try {
     const data = await fetchJSON(`/api/session/${sid}/games`);
     CURRENT_SESSION_ID = sid;
+
+    // Meta + stats
     const metaEl = getEl("sessionMeta");
     if (metaEl) metaEl.textContent = `${data.bowler} · ${data.alley} · ${data.session_date}`;
 
     const statsHost = getEl("sessionStats");
     if (statsHost) {
+      const avg = (data.stats.avg == null) ? "—" : Number(data.stats.avg).toFixed(2);
       statsHost.innerHTML = `
         <div class="row text-center mb-3">
-          <div class="col"><strong>Avg:</strong> ${data.stats.avg ?? "—"}</div>
+          <div class="col"><strong>Avg:</strong> ${avg}</div>
           <div class="col"><strong>Low:</strong> ${data.stats.low ?? "—"}</div>
           <div class="col"><strong>High:</strong> ${data.stats.high ?? "—"}</div>
         </div>`;
     }
 
+    // Games table body
     const tbody = getEl("sessionGamesTbody");
     if (tbody) {
       tbody.innerHTML = "";
       data.games.forEach(g => {
-        const likeBtnId = `like-btn-${g.id ?? 'sid'+sid+'-gn'+g.game_number}`;
-        const likeCountId = `like-count-${g.id ?? 'sid'+sid+'-gn'+g.game_number}`;
-        const gidAttr = (typeof g.id === "number" && g.id > 0) ? g.id : "";
-        tbody.innerHTML += `
-          <tr data-gn="${g.game_number}">
-            <td>${g.game_number}</td>
-            <td class="text-end">${g.score}</td>
-            <td class="text-end">
-              <button id="${likeBtnId}" class="btn btn-sm btn-outline-primary" onclick="return likeGameSmart('${gidAttr}', ${sid}, ${g.game_number});">
-                👍 Like
-              </button>
-              <span class="ms-2 small text-secondary" id="${likeCountId}">${g.like_count ?? 0}</span>
-            </td>
-          </tr>`;
+        const row = document.createElement("tr");
+        row.setAttribute("data-gid", g.id);
+        row.setAttribute("data-gn", g.game_number);
+
+        const commentsHtml = (g.comments || []).map(c => `
+          <div class="ps-2 border-start small mt-1">
+            <div class="fw-semibold">${escapeHtml(c.user_name || "Guest")}</div>
+            <div>${escapeHtml(c.comment)}</div>
+            <div class="text-muted">${c.created_at || ""}</div>
+          </div>
+        `).join("");
+
+        row.innerHTML = `
+          <td>${g.game_number}</td>
+          <td class="text-end">${g.score}</td>
+          <td class="text-end" style="min-width: 300px;">
+            <div class="d-flex justify-content-end align-items-center gap-2">
+              <button class="btn btn-sm btn-outline-primary js-like">👍 Like</button>
+              <span class="small text-secondary js-like-count">${g.like_count ?? 0}</span>
+            </div>
+            <div class="input-group input-group-sm mt-1">
+              <input type="text" class="form-control js-comment" placeholder="Add a comment (optional)">
+              <button class="btn btn-primary js-post">Post</button>
+            </div>
+            ${commentsHtml ? `<div class="mt-2">${commentsHtml}</div>` : ``}
+          </td>
+        `;
+        // wire up buttons
+        row.querySelector(".js-like").addEventListener("click", () => postLikeWithOptionalComment(g.id, ""));
+        row.querySelector(".js-post").addEventListener("click", async () => {
+          const txt = row.querySelector(".js-comment");
+          const val = (txt.value || "").trim();
+          await postLikeWithOptionalComment(g.id, val);
+          txt.value = "";
+        });
+
+        tbody.appendChild(row);
       });
+
+      // Add-game row (final row)
+      const addRow = document.createElement("tr");
+      addRow.innerHTML = `
+        <td colspan="3">
+          <div class="d-flex justify-content-end align-items-center gap-2">
+            <input type="number" min="1" max="300" class="form-control form-control-sm" id="addGameScore" placeholder="New score" style="max-width:140px">
+            <button class="btn btn-sm btn-primary" id="addGameBtn">Add Game</button>
+            <span class="ms-2 small text-muted" id="addGameMsg"></span>
+          </div>
+        </td>
+      `;
+      tbody.appendChild(addRow);
+
+      // Bind add game
+      addRow.querySelector("#addGameBtn").addEventListener("click", addGameToCurrentSession);
     }
 
     const modalEl = getEl("sessionModal");
@@ -217,32 +261,75 @@ async function showSessionGames(sid) {
   return false;
 }
 
-async function likeGameSmart(gameIdStr, sessionId, gameNumber) {
-  // First try by game id if valid
-  const gid = parseInt(gameIdStr, 10);
+async function postLikeWithOptionalComment(gameId, comment) {
   try {
-    if (Number.isInteger(gid) && gid > 0) {
-      const res = await fetchJSON(apiUrl(`/api/game/${gid}/like`), { method: "POST" });
-      const cntEl = document.getElementById(`like-count-${gid}`) || document.getElementById(`like-count-sid${sessionId}-gn${gameNumber}`);
+    const payload = {};
+    if (comment) payload.comment = comment;
+    const res = await fetchJSON(apiUrl(`/api/games/${gameId}/like`), { method: "POST", body: JSON.stringify(payload) });
+
+    // update the row UI
+    const row = document.querySelector(`tr[data-gid="${gameId}"]`);
+    if (row) {
+      const cntEl = row.querySelector(".js-like-count");
       if (cntEl) cntEl.textContent = res.likes;
-      await renderLikesTotal();
-      return false;
+
+      // rebuild comments area
+      let commentsWrap = row.querySelector(".mt-2");
+      if (!commentsWrap) {
+        if (res.comments && res.comments.length) {
+          const td = row.children[2];
+          commentsWrap = document.createElement("div");
+          commentsWrap = document.createElement("div");
+          commentsWrap.className = "mt-2";
+          td.appendChild(commentsWrap);
+        }
+      }
+      if (commentsWrap) {
+        commentsWrap.innerHTML = (res.comments || []).map(c => `
+          <div class="ps-2 border-start small mt-1">
+            <div class="fw-semibold">${escapeHtml(c.user_name || "Guest")}</div>
+            <div>${escapeHtml(c.comment)}</div>
+            <div class="text-muted">${c.created_at || ""}</div>
+          </div>
+        `).join("");
+      }
     }
-    // Fallback to session/game_number route
-    const res = await fetchJSON(apiUrl(`/api/session/${sessionId}/game/${gameNumber}/like`), { method: "POST" });
-    const key = `sid${sessionId}-gn${gameNumber}`;
-    const cntEl = document.getElementById(`like-count-${res.game_id}`) || document.getElementById(`like-count-${key}`);
-    if (cntEl) cntEl.textContent = res.likes;
     await renderLikesTotal();
-    return false;
   } catch (e) {
-    console.error("likeGameSmart failed:", e);
-    alert("Failed to like this game: " + e.message);
-    return false;
+    console.error("postLikeWithOptionalComment failed:", e);
+    alert("Failed to like/comment: " + e.message);
   }
 }
 
-// ---------- Totals ----------
+async function addGameToCurrentSession() {
+  const scoreEl = getEl("addGameScore");
+  const msgEl = getEl("addGameMsg");
+  if (!scoreEl) return;
+  const v = scoreEl.value ? parseInt(scoreEl.value, 10) : null;
+  if (!v || v < 1 || v > 300) {
+    if (msgEl) msgEl.textContent = "Enter a score 1–300.";
+    return;
+  }
+  try {
+    await fetchJSON(`/api/sessions/${CURRENT_SESSION_ID}/games`, {
+      method: "POST",
+      body: JSON.stringify({ score: v })
+    });
+    if (msgEl) msgEl.textContent = "Added!";
+    scoreEl.value = "";
+
+    // refresh modal content with latest games/likes/comments/stats
+    await showSessionGames(CURRENT_SESSION_ID);
+    // refresh aggregates outside modal
+    await renderTotals();
+    await renderHonorRoll();
+  } catch (e) {
+    console.error("addGameToCurrentSession failed:", e);
+    if (msgEl) msgEl.textContent = "Failed: " + e.message;
+  }
+}
+
+// ---------- Totals (renders comments) ----------
 async function renderTotals() {
   try {
     const data = await fetchJSON("/api/totals");
@@ -269,13 +356,12 @@ async function renderTotals() {
         </h5>
         <div class="text-secondary mb-2">${line}</div>`;
 
-      // Header row for Alleys + Likes badge shown just above the table
+      // Alleys
       html += `<div class="d-flex justify-content-between align-items-center mt-2 mb-1">
         <span class="text-secondary">Alleys</span>
         <span class="badge bg-success" title="Total likes for ${t.name}">Likes: ${t.likes ?? 0}</span>
       </div>`;
 
-      // Alleys table
       if (t.alleys?.length) {
         html += `<div class="table-responsive"><table class="table table-sm table-striped align-middle">
           <thead><tr><th>Alley</th><th class="text-end">Avg</th><th class="text-end">Games</th></tr></thead><tbody>`;
@@ -286,6 +372,29 @@ async function renderTotals() {
       } else {
         html += `<div class="text-secondary">No alley breakdown yet.</div>`;
       }
+
+      // Comments (count + last 10)
+      const haveComments = (t.comments_recent && t.comments_recent.length);
+      html += `
+        <div class="mt-3">
+          <div class="d-flex align-items-center justify-content-between">
+            <h6 class="mb-1">Comments <span class="badge bg-secondary">${t.comments_count ?? 0}</span></h6>
+          </div>
+          ${haveComments ? `
+            <div class="list-group">
+              ${t.comments_recent.map(c => `
+                <div class="list-group-item py-2">
+                  <div class="small text-muted d-flex justify-content-between">
+                    <span><strong>${escapeHtml(c.user_name || "Guest")}</strong> on Game ${c.game_number} (${c.session_date} @ ${escapeHtml(c.alley)})</span>
+                    <span>${c.created_at || ""}</span>
+                  </div>
+                  <div>${escapeHtml(c.comment)}</div>
+                </div>
+              `).join("")}
+            </div>
+          ` : `<div class="text-secondary small">No comments yet.</div>`}
+        </div>
+      `;
 
       html += `</div>`;
     }
@@ -303,7 +412,7 @@ async function renderTotals() {
 async function renderHonorRoll() {
   try {
     const el = getEl("honorRollBlock");
-    if (!el) return; // container missing — skip
+    if (!el) return;
     const data = await fetchJSON("/api/honor-roll");
     const wk = data.week.range.join("–");
     const mo = data.month.range.join("–");
@@ -349,12 +458,12 @@ async function renderHonorRoll() {
   }
 }
 
-// ---------- Likes Total Badge (optional) ----------
+// ---------- Likes Total Badge ----------
 async function renderLikesTotal() {
   try {
     const host = getEl("likesTotalHost");
     const badge = getEl("likesTotalBadge");
-    if (!host && !badge) return; // no placeholder in DOM
+    if (!host && !badge) return;
     const data = await fetchJSON("/api/likes/total");
     if (badge) badge.textContent = data.total_likes;
     else if (host) host.innerHTML = `Total Likes <span class="badge bg-success ms-2" id="likesTotalBadge">${data.total_likes}</span>`;
