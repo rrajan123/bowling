@@ -1,537 +1,668 @@
-from flask import Flask, g, jsonify, request, send_file, render_template, abort
-import sqlite3
-import os
-from datetime import date, timedelta, datetime
+from flask import Flask, g, jsonify, request, render_template
+import sqlite3, os
+import re
+from datetime import date, datetime, timedelta
+from math import sqrt
+
+# --- Display helpers ---
+NAME_ALIASES = {"Steve Baule": "Baule"}
+
+def display_bowler(name: str) -> str:
+    return NAME_ALIASES.get(name, name)
 
 # ---------- Paths ----------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
 DB_PATH = os.environ.get(
     "BOWLING_DB",
     r"C:\sites\bowling\bowling.sqlite3" if os.name == "nt" else os.path.join(APP_DIR, "bowling.sqlite3")
 )
 
-TIPS_PATH = os.path.join(APP_DIR, "365_bowling_tips.txt")
-
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
-# ---------- Tips ----------
-_TIPS_CACHE = None
-def _load_tips():
-    global _TIPS_CACHE
-    if _TIPS_CACHE is not None:
-        return _TIPS_CACHE
-    tips = []
-    try:
-        with open(TIPS_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                t = line.strip()
-                if t:
-                    tips.append(t)
-    except Exception:
-        tips = [
-            "Focus on your target arrow, not the pins.",
-            "Keep your swing smooth and relaxed.",
-            "Maintain consistent timing in your approach.",
-            "Follow through straight toward your target.",
-            "Use a ball that fits your hand comfortably.",
-        ]
-    _TIPS_CACHE = tips
-    return tips
-
-def tip_for_today() -> str:
-    tips = _load_tips()
-    if not tips:
-        return ""
-    ordinal = date.today().toordinal()
-    return tips[ordinal % len(tips)]
-
-# ---------- DB Helpers ----------
+# ---------- DB ----------
 def get_db():
     if "db" not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        g.db = conn
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
     return g.db
 
 @app.teardown_appcontext
-def close_db(e=None):
+def close_db(_=None):
     db = g.pop("db", None)
-    if db is not None:
+    if db:
         db.close()
 
-def _column_exists(db, table, col):
-    rows = db.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"].lower() == col.lower() for r in rows)
+def current_year():
+    return date.today().year
 
+# ---------- Defaults (safe inserts) ----------
 def ensure_defaults():
-    """Seed reference data and evolve schema safely."""
     db = get_db()
 
-    # alleys
-    for name in [
-        "Zodos Lanes", "Camarillo Bowl", "Sunset Lanes", "Lilac Lanes",
-        "North Bowl", "Winnetka Bowl", "Milwaukie Bowl"
-    ]:
-        db.execute("INSERT OR IGNORE INTO alleys (name) VALUES (?)", (name,))
+    
+    def migrate_sessions_unique():
+        """Allow up to two sessions per bowler per day (league + non-league).
 
-    # bowlers
-    for name, grp in [
-        ("Rajan", "A"), ("Medina", "A"),
-        ("Baule", "B"), ("Barsotti", "B"), ("RJB", "B")
-    ]:
-        db.execute("INSERT OR IGNORE INTO bowlers (name, bix_group) VALUES (?,?)", (name, grp))
+        Desired rule:
+          - A bowler may have **one league** AND **one non-league** session on the same date.
+          - But they may NOT have two league (or two non-league) sessions on the same date.
+
+        Enforced by UNIQUE(bowler_id, session_date, is_league).
+        This handles both legacy table-level UNIQUE(bowler_id, session_date) constraints and
+        legacy unique indexes that enforce (bowler_id, session_date) only.
+        """
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ).fetchone()
+        if not row or not row[0]:
+            return
+
+        create_sql = row[0]
+        lower_sql = create_sql.lower()
+
+        # Detect the *specific* legacy constraint UNIQUE(bowler_id, session_date)
+        # (Note: 'is_league' may exist elsewhere in the CREATE TABLE even in legacy DBs.)
+        legacy_unique_clause = re.search(
+            r"unique\s*\(\s*bowler_id\s*,\s*session_date\s*\)",
+            lower_sql
+        ) is not None
+
+        # Also detect legacy unique INDEX enforcing only (bowler_id, session_date)
+        idx_rows = db.execute("PRAGMA index_list(sessions)").fetchall()
+        legacy_unique_index_name = None
+        for ir in idx_rows:
+            # ir columns: (seq, name, unique, origin, partial)
+            if int(ir[2]) != 1:
+                continue
+            idx_name = ir[1]
+            cols = [c[2] for c in db.execute(f"PRAGMA index_info({idx_name})").fetchall()]
+            if cols == ["bowler_id", "session_date"]:
+                legacy_unique_index_name = idx_name
+                break
+
+        # If the legacy uniqueness is a *table constraint* (autoindex), rebuild.
+        if legacy_unique_clause:
+            cols = [r[1] for r in db.execute("PRAGMA table_info(sessions)").fetchall()]
+            db.execute("ALTER TABLE sessions RENAME TO sessions_old")
+            db.execute(
+                """
+                CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bowler_id INTEGER NOT NULL,
+                    alley_id INTEGER NOT NULL,
+                    session_date TEXT NOT NULL,
+                    is_league INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(bowler_id, session_date, is_league),
+                    FOREIGN KEY(bowler_id) REFERENCES bowlers(id),
+                    FOREIGN KEY(alley_id) REFERENCES alleys(id)
+                )
+                """
+            )
+
+            if "is_league" in cols:
+                db.execute(
+                    """
+                    INSERT INTO sessions(id, bowler_id, alley_id, session_date, is_league)
+                    SELECT id, bowler_id, alley_id, session_date, COALESCE(is_league,0)
+                    FROM sessions_old
+                    """
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO sessions(id, bowler_id, alley_id, session_date, is_league)
+                    SELECT id, bowler_id, alley_id, session_date, 0
+                    FROM sessions_old
+                    """
+                )
+
+            db.execute("DROP TABLE sessions_old")
+            # Also add an explicit unique index (harmless) for query planners / clarity.
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_bowler_date_type ON sessions(bowler_id, session_date, is_league)"
+            )
+            return
+
+        # If legacy uniqueness is enforced by a droppable unique index, drop it.
+        if legacy_unique_index_name and not legacy_unique_index_name.startswith("sqlite_autoindex"):
+            db.execute(f"DROP INDEX IF EXISTS {legacy_unique_index_name}")
+
+        # Ensure correct uniqueness going forward.
         db.execute(
-            "UPDATE bowlers SET bix_group=? WHERE name=? AND (bix_group IS NULL OR bix_group='')",
-            (grp, name)
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_bowler_date_type ON sessions(bowler_id, session_date, is_league)"
         )
+        return
 
-    # games.like_count
-    if not _column_exists(db, "games", "like_count"):
-        db.execute("ALTER TABLE games ADD COLUMN like_count INTEGER DEFAULT 0")
 
-    # games.created_at
-    if not _column_exists(db, "games", "created_at"):
-        try:
-            db.execute("ALTER TABLE games ADD COLUMN created_at TEXT DEFAULT (datetime('now'))")
-        except Exception:
-            pass
-
-    # game_reactions
+    # Create tables if missing (minimal schema expected by app)
     db.execute("""
-        CREATE TABLE IF NOT EXISTS game_reactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-            user_name TEXT,
-            comment TEXT,
-            is_like INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_game_reactions_game_id ON game_reactions(game_id)"
-    )
+    CREATE TABLE IF NOT EXISTS bowlers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        bix_group TEXT NOT NULL
+    )""")
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS alleys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL
+    )""")
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bowler_id INTEGER NOT NULL,
+        alley_id INTEGER NOT NULL,
+        session_date TEXT NOT NULL,
+        is_league INTEGER NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(bowler_id) REFERENCES bowlers(id),
+        FOREIGN KEY(alley_id) REFERENCES alleys(id)
+    )""")
+
+    # --- Lightweight migrations ---
+    # Add is_league column if upgrading an existing DB
+    cols = [r[1] for r in db.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "is_league" not in cols:
+        db.execute("ALTER TABLE sessions ADD COLUMN is_league INTEGER NOT NULL DEFAULT 0")
+
+    # Add notes column (session notes)
+    cols = [r[1] for r in db.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "notes" not in cols:
+        db.execute("ALTER TABLE sessions ADD COLUMN notes TEXT NOT NULL DEFAULT \'\'")
+
+    # Ensure uniqueness constraint allows league + non-league on the same date.
+    migrate_sessions_unique()
+
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        game_number INTEGER NOT NULL,
+        score INTEGER NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(id)
+    )""")
+
+    # Seed alleys
+    for a in [
+        "Zodos Lanes","Camarillo Bowl","Sunset Lanes","Lilac Lanes",
+        "North Bowl","Winnetka Bowl","Milwaukie Bowl"
+    ]:
+        db.execute("INSERT OR IGNORE INTO alleys(name) VALUES(?)", (a,))
+
+    # Seed bowlers (Group A uses Rajan/Medina calculation)
+    for name, grp in [
+        ("Rajan","A"),("Medina","A"),("William","A"),("Edward","A"),("Larry","A"),
+        ("Baule","B"),("Pete Barsotti", "B"),("Barsotti","B"),("RJB","B")
+    ]:
+        db.execute("INSERT OR IGNORE INTO bowlers(name,bix_group) VALUES(?,?)", (name, grp))
+
     db.commit()
 
 @app.before_request
-def ensure_db():
-    if not os.path.exists(DB_PATH):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    try:
-        ensure_defaults()
-    except Exception:
-        pass
+def _init():
+    ensure_defaults()
 
-def rows_to_dicts(rows):
-    return [dict(r) for r in rows]
+# ---------- Diagnostics ----------
+@app.get("/api/_whoami")
+def whoami():
+    return jsonify({"file": os.path.abspath(__file__), "cwd": os.getcwd()})
 
-# ---------- Utility: Compute stats ----------
-def compute_session_stats(db, sid):
-    row = db.execute(
-        "SELECT ROUND(AVG(score),2) AS avg_score, MIN(score) AS low_score, MAX(score) AS high_score, COUNT(*) AS games_count "
-        "FROM games WHERE session_id=?",
-        (sid,),
-    ).fetchone()
-    if not row or not row["games_count"]:
-        return {"avg": None, "low": None, "high": None, "count": 0}
-    return {
-        "avg": float(row["avg_score"]),
-        "low": row["low_score"],
-        "high": row["high_score"],
-        "count": row["games_count"],
-    }
-
-# ---------- Routes ----------
+# ---------- Pages ----------
 @app.get("/")
 def home():
     return render_template("index.html")
 
+# ---------- Lookups ----------
 @app.get("/api/lookups")
-def api_lookups():
+def lookups():
     db = get_db()
-    bowlers = rows_to_dicts(db.execute("SELECT id,name,bix_group FROM bowlers ORDER BY name"))
-    alleys = rows_to_dicts(
-        db.execute("SELECT id,name FROM alleys WHERE name!='Milwaukie Lanes' ORDER BY name")
-    )
-    return jsonify({"bowlers": bowlers, "alleys": alleys})
+    return jsonify({
+        "bowlers": [dict(r) for r in db.execute("SELECT id,name,bix_group FROM bowlers ORDER BY name")],
+        "alleys": [dict(r) for r in db.execute("SELECT id,name FROM alleys ORDER BY name")]
+    })
 
-# ---------- Sessions (list + detail) ----------
-@app.get("/api/sessions")
-def api_sessions():
+# ---------- Add Alley ----------
+@app.post("/api/alleys")
+def add_alley():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error":"Alley name required"}), 400
     db = get_db()
+    exists = db.execute("SELECT id FROM alleys WHERE LOWER(name)=LOWER(?)", (name,)).fetchone()
+    if exists:
+        return jsonify({"error":"Alley already exists"}), 400
+    db.execute("INSERT INTO alleys(name) VALUES(?)", (name,))
+    db.commit()
+    return jsonify({"ok": True, "name": name})
+
+# ---------- Sessions (current year) ----------
+@app.get("/api/sessions")
+def sessions():
+    db = get_db()
+    y = str(current_year())
     rows = db.execute(
         """
         SELECT s.id, s.session_date, b.name AS bowler, a.name AS alley,
-               (SELECT COUNT(*) FROM games WHERE session_id=s.id) AS games,
-               (SELECT ROUND(AVG(score),2) FROM games WHERE session_id=s.id) AS session_avg
+               s.is_league AS is_league,
+               COALESCE(s.notes,'') AS notes,
+               COUNT(g.id) AS games, ROUND(AVG(g.score),2) AS session_avg
         FROM sessions s
         JOIN bowlers b ON b.id=s.bowler_id
         JOIN alleys a ON a.id=s.alley_id
+        JOIN games g ON g.session_id=s.id
+        WHERE strftime('%Y', s.session_date)=?
+        GROUP BY s.id
         ORDER BY s.session_date DESC, b.name
-        """
+        """, (y,)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
-@app.get("/api/session/<int:sid>/games")
-def api_session_games(sid):
+# ---------- League Sessions (current year) ----------
+@app.get("/api/league-sessions")
+def league_sessions():
     db = get_db()
-    sess = db.execute(
-        "SELECT s.id, s.session_date, b.name AS bowler, a.name AS alley "
-        "FROM sessions s JOIN bowlers b ON b.id=s.bowler_id "
-        "JOIN alleys a ON a.id=s.alley_id WHERE s.id=?",
-        (sid,),
-    ).fetchone()
-    if not sess:
-        return jsonify({"error": "Session not found"}), 404
+    y = str(current_year())
+    rows = db.execute(
+        """
+        SELECT s.id AS session_id, s.session_date, b.name AS bowler, a.name AS alley,
+               COUNT(g.id) AS games,
+               COALESCE(SUM(g.score),0) AS total_pins,
+               ROUND(AVG(g.score),0) AS session_avg
+        FROM sessions s
+        JOIN bowlers b ON b.id=s.bowler_id
+        JOIN alleys a ON a.id=s.alley_id
+        JOIN games g ON g.session_id=s.id
+        WHERE s.is_league=1 AND strftime('%Y', s.session_date)=?
+        GROUP BY s.id
+        ORDER BY s.session_date DESC, b.name
+        """,
+        (y,)
+    ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        # ensure ints for display
+        d["total_pins"] = int(d.get("total_pins") or 0)
+        d["session_avg"] = int(d.get("session_avg") or 0)
+        out.append(d)
+    return jsonify(out)
 
-    has_created_at = _column_exists(db, "games", "created_at")
-    if has_created_at:
-        games = rows_to_dicts(
-            db.execute(
-                "SELECT id, game_number, score, COALESCE(like_count,0) AS like_count, created_at "
-                "FROM games WHERE session_id=? ORDER BY game_number",
-                (sid,),
-            )
-        )
-    else:
-        games = rows_to_dicts(
-            db.execute(
-                "SELECT id, game_number, score, COALESCE(like_count,0) AS like_count "
-                "FROM games WHERE session_id=? ORDER BY game_number",
-                (sid,),
-            )
-        )
-        for g in games:
-            g["created_at"] = None
+# ---------- League Standings (current year) ----------
+@app.get("/api/league-standings")
+def league_standings():
+    db = get_db()
+    y = str(current_year())
 
-    # Attach comments per game
-    for g in games:
-        g["comments"] = rows_to_dicts(
-            db.execute(
-                "SELECT id, user_name, comment, created_at FROM game_reactions "
-                "WHERE game_id=? AND (comment IS NOT NULL AND comment!='') "
-                "ORDER BY id DESC",
-                (g["id"],),
-            )
-        )
+    # aggregate league-only stats per bowler
+    rows = db.execute(
+        """
+        SELECT b.id AS bowler_id, b.name AS name, b.bix_group AS bix_group,
+               COUNT(g.id) AS games,
+               COALESCE(SUM(g.score),0) AS total_pins,
+               AVG(g.score) AS avg,
+               COALESCE(SUM(CASE WHEN g.score>=200 THEN 1 ELSE 0 END),0) AS c200,
+               COALESCE(SUM(CASE WHEN g.score>=210 THEN 1 ELSE 0 END),0) AS c210,
+               COALESCE(SUM(CASE WHEN g.score>=250 THEN 1 ELSE 0 END),0) AS c250,
+               COALESCE(SUM(CASE WHEN g.score=300 THEN 1 ELSE 0 END),0) AS c300,
+               COALESCE(SUM(CASE WHEN g.score>=150 THEN 1 ELSE 0 END),0) AS c150
+        FROM bowlers b
+        LEFT JOIN sessions s ON s.bowler_id=b.id AND s.is_league=1 AND strftime('%Y', s.session_date)=?
+        LEFT JOIN games g ON g.session_id=s.id
+        GROUP BY b.id, b.name, b.bix_group
+        ORDER BY avg DESC
+        """,
+        (y,)
+    ).fetchall()
 
-    stats = compute_session_stats(db, sid)
-    return jsonify(
-        {
-            "id": sess["id"],
-            "session_date": sess["session_date"],
-            "bowler": sess["bowler"],
-            "alley": sess["alley"],
+    standings = []
+    for r in rows:
+        games = int(r["games"] or 0)
+        total_pins = int(r["total_pins"] or 0)
+        avg_raw = float(r["avg"] or 0.0)
+        avg_round = int(round(avg_raw)) if games else 0
+        bix = compute_bix(r["bix_group"], avg_raw, int(r["c150"] or 0), int(r["c210"] or 0), int(r["c250"] or 0), int(r["c300"] or 0))
+        standings.append({
+            "bowler_id": r["bowler_id"],
+            "name": display_bowler(r["name"]),
+            "bix_group": r["bix_group"],
             "games": games,
-            "stats": stats,
-        }
-    )
-
-# ---------- NEW: Create/append sessions ----------
-@app.post("/api/session")
-def api_create_or_append_session():
-    """
-    Creates a session for (bowler_id, alley_id, session_date) if not exists,
-    then inserts provided scores (max 12 total per session).
-    Request JSON: { bowler_id, alley_id, session_date: 'YYYY-MM-DD', scores: [int,...] }
-    """
-    db = get_db()
-    data = request.get_json(silent=True) or {}
-    bowler_id = int(data.get("bowler_id") or 0)
-    alley_id = int(data.get("alley_id") or 0)
-    session_date = (data.get("session_date") or "").strip()
-    scores = data.get("scores") or []
-
-    if not bowler_id or not alley_id or not session_date:
-        return jsonify({"error": "bowler_id, alley_id, session_date required"}), 400
-    if not isinstance(scores, list) or not scores:
-        return jsonify({"error": "scores array required"}), 400
-
-    # Find or create session
-    row = db.execute(
-        "SELECT id FROM sessions WHERE bowler_id=? AND alley_id=? AND session_date=?",
-        (bowler_id, alley_id, session_date)
-    ).fetchone()
-    if row:
-        sid = row["id"]
-    else:
-        db.execute(
-            "INSERT INTO sessions (bowler_id, alley_id, session_date) VALUES (?,?,?)",
-            (bowler_id, alley_id, session_date)
-        )
-        db.commit()
-        sid = db.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-
-    # current count / next game_number
-    cur = db.execute("SELECT COUNT(*) FROM games WHERE session_id=?", (sid,)).fetchone()[0] or 0
-    if cur >= 12:
-        return jsonify({"error": "This session already has 12 games."}), 400
-
-    next_num = cur + 1
-    to_add = []
-    for s in scores:
-        try:
-            sc = int(s)
-        except Exception:
-            return jsonify({"error": f"Invalid score: {s}"}), 400
-        if sc < 1 or sc > 300:
-            return jsonify({"error": "Scores must be 1–300"}), 400
-        if next_num > 12:
-            break
-        to_add.append((sid, next_num, sc))
-        next_num += 1
-
-    if not to_add:
-        return jsonify({"error": "No scores were added (limit is 12 per session)."}), 400
-
-    db.executemany(
-        "INSERT INTO games (session_id, game_number, score) VALUES (?,?,?)",
-        to_add
-    )
-    db.commit()
-
-    return jsonify({"ok": True, "session_id": sid, "added": len(to_add)})
-
-@app.post("/api/sessions/<int:sid>/games")
-def api_add_game_to_session(sid):
-    """Append one game to an existing session, enforcing the 12-game cap. JSON: {score:int}"""
-    db = get_db()
-    sess = db.execute("SELECT id FROM sessions WHERE id=?", (sid,)).fetchone()
-    if not sess:
-        return jsonify({"error": "Session not found"}), 404
-
-    data = request.get_json(silent=True) or {}
-    try:
-        score = int(data.get("score"))
-    except Exception:
-        return jsonify({"error": "score required"}), 400
-    if score < 1 or score > 300:
-        return jsonify({"error": "Score must be 1–300"}), 400
-
-    cur = db.execute("SELECT COUNT(*) FROM games WHERE session_id=?", (sid,)).fetchone()[0] or 0
-    if cur >= 12:
-        return jsonify({"error": "This session already has 12 games."}), 400
-
-    next_num = cur + 1
-    db.execute(
-        "INSERT INTO games (session_id, game_number, score) VALUES (?,?,?)",
-        (sid, next_num, score)
-    )
-    db.commit()
-    return jsonify({"ok": True, "game_number": next_num})
-
-# ---------- Likes & Comments ----------
-@app.post("/api/games/<int:gid>/like")
-def api_like_game(gid):
-    db = get_db()
-    game = db.execute("SELECT id FROM games WHERE id=?", (gid,)).fetchone()
-    if not game:
-        return jsonify({"error": "Invalid game ID"}), 404
-
-    data = request.get_json(silent=True) or {}
-    user_name = (data.get("user_name") or "").strip() or None
-    comment = (data.get("comment") or "").strip() or None
-
-    db.execute(
-        "INSERT INTO game_reactions (game_id, user_name, comment, is_like) VALUES (?,?,?,1)",
-        (gid, user_name, comment),
-    )
-    db.execute("UPDATE games SET like_count=COALESCE(like_count,0)+1 WHERE id=?", (gid,))
-    db.commit()
-
-    likes = db.execute(
-        "SELECT COALESCE(like_count,0) FROM games WHERE id=?", (gid,)
-    ).fetchone()[0]
-    comments = rows_to_dicts(
-        db.execute(
-            "SELECT id, user_name, comment, created_at FROM game_reactions "
-            "WHERE game_id=? AND (comment IS NOT NULL AND comment!='') ORDER BY id DESC",
-            (gid,),
-        )
-    )
-    return jsonify({"ok": True, "likes": likes, "comments": comments})
-
-# ---------- Totals (includes comments) ----------
-@app.get("/api/totals")
-def api_totals():
-    db = get_db()
-    bowlers = rows_to_dicts(db.execute("SELECT id,name,bix_group FROM bowlers ORDER BY name"))
-    totals = []
-    bix_by_name = {}
-
-    def compute_alley_breakdown(db, bowler_id):
-        rows = db.execute(
-            "SELECT a.name AS alley, AVG(g.score) AS avg_score, COUNT(*) AS games "
-            "FROM sessions s JOIN alleys a ON a.id=s.alley_id "
-            "JOIN games g ON g.session_id=s.id "
-            "WHERE s.bowler_id=? "
-            "GROUP BY a.name ORDER BY a.name",
-            (bowler_id,)
-        ).fetchall()
-        return [
-            {"alley": r["alley"], "avg": round(r["avg_score"],2) if r["avg_score"] is not None else 0.0, "games": r["games"]}
-            for r in rows
-        ]
-
-    def compute_bix_for_bowler(db, bowler_id, bix_group):
-        avg_row = db.execute(
-            "SELECT AVG(score) AS avg_score, COUNT(*) AS games "
-            "FROM games WHERE session_id IN (SELECT id FROM sessions WHERE bowler_id=?)",
-            (bowler_id,)
-        ).fetchone()
-        avg = (avg_row["avg_score"] or 0)
-        games_count = avg_row["games"] or 0
-
-        r = db.execute(
-            "SELECT "
-            "SUM(CASE WHEN score>=200 THEN 1 ELSE 0 END) AS c200, "
-            "SUM(CASE WHEN score>=210 THEN 1 ELSE 0 END) AS c210, "
-            "SUM(CASE WHEN score>=250 THEN 1 ELSE 0 END) AS c250, "
-            "SUM(CASE WHEN score=300 THEN 1 ELSE 0 END) AS c300, "
-            "SUM(CASE WHEN score>=150 THEN 1 ELSE 0 END) AS c150 "
-            "FROM games WHERE session_id IN (SELECT id FROM sessions WHERE bowler_id=?)",
-            (bowler_id,)
-        ).fetchone()
-        c200 = r["c200"] or 0
-        c210 = r["c210"] or 0
-        c250 = r["c250"] or 0
-        c300 = r["c300"] or 0
-        c150 = r["c150"] or 0
-
-        bix = avg
-        if bix_group == "A":
-            bix += 0.25 * c210
-            bix += 0.50 * c250
-            bix += 2.50 * c300
-            bonus = db.execute(
-                "SELECT SUM(CASE WHEN cnt=12 AND avg_score>=210 THEN 2.5 ELSE 0 END) AS bonus "
-                "FROM ("
-                "  SELECT id, COUNT(*) AS cnt, AVG(score) AS avg_score "
-                "  FROM games WHERE session_id IN (SELECT id FROM sessions WHERE bowler_id=?) "
-                "  GROUP BY session_id"
-                ")",
-                (bowler_id,)
-            ).fetchone()
-            bix += (bonus["bonus"] or 0)
-        else:
-            bix += 0.25 * c150
-
-        return {
-            "avg": round(avg, 2) if games_count else 0.0,
-            "games": games_count,
-            "c200": c200, "c210": c210, "c250": c250, "c300": c300, "c150": c150,
-            "bix": round(bix, 2)
-        }
-
-    for b in bowlers:
-        met = compute_bix_for_bowler(db, b["id"], b["bix_group"])
-        alleys = compute_alley_breakdown(db, b["id"])
-
-        # Likes
-        likes = db.execute(
-            "SELECT COALESCE(SUM(like_count),0) FROM games "
-            "WHERE session_id IN (SELECT id FROM sessions WHERE bowler_id=?)",
-            (b["id"],)
-        ).fetchone()[0] or 0
-
-        # Comments count
-        comments_count = db.execute(
-            """
-            SELECT COUNT(*) FROM game_reactions gr
-            JOIN games g ON g.id=gr.game_id
-            JOIN sessions s ON s.id=g.session_id
-            WHERE s.bowler_id=? AND gr.comment IS NOT NULL AND gr.comment<>''
-            """,
-            (b["id"],),
-        ).fetchone()[0] or 0
-
-        # Recent comments (10)
-        recent_comments = rows_to_dicts(
-            db.execute(
-                """
-                SELECT gr.id, COALESCE(gr.user_name,'') AS user_name, gr.comment, gr.created_at,
-                       g.id AS game_id, g.game_number, s.session_date, a.name AS alley
-                FROM game_reactions gr
-                JOIN games g ON g.id=gr.game_id
-                JOIN sessions s ON s.id=g.session_id
-                JOIN alleys a ON a.id=s.alley_id
-                WHERE s.bowler_id=? AND gr.comment IS NOT NULL AND gr.comment<>''
-                ORDER BY gr.id DESC LIMIT 10
-                """,
-                (b["id"],),
-            )
-        )
-
-        totals.append({
-            "name": b["name"],
-            "bix_group": b["bix_group"],
-            **met,
-            "alleys": alleys,
-            "likes": int(likes),
-            "comments_count": int(comments_count),
-            "comments_recent": recent_comments
+            "total_pins": total_pins,
+            "avg": avg_round,
+            "bix": round(bix, 2),
         })
-        bix_by_name[b["name"]] = met["bix"]
 
-    # Rivalry line (Rajan vs Medina), monthly avgs, and total likes — expected by UI
-    r_bix = bix_by_name.get("Rajan")
-    m_bix = bix_by_name.get("Medina")
-    bix_msg = None
-    if isinstance(r_bix, (int, float)) and isinstance(m_bix, (int, float)):
-        diff = round(r_bix - m_bix, 2)
-        if diff == 0:
-            bix_msg = "Rajan and Medina are tied in BIX."
-        elif diff > 0:
-            bix_msg = f"Rajan's BIX is {abs(diff):.2f} higher than Medina."
-        else:
-            bix_msg = f"Medina's BIX is {abs(diff):.2f} higher than Rajan."
+    # league-only BIX table for the A-group rivals
+    rivals = ["Rajan", "Medina", "William", "Edward","Larry",]
+    riv = [s for s in standings if s["name"] in rivals]
+    riv.sort(key=lambda x: x["bix"], reverse=True)
+    leader = riv[0]["bix"] if riv else 0.0
+    league_bix_table = [
+        {"name": r["name"], "bix": r["bix"], "diff": round(r["bix"] - leader, 2), "leader": (r["bix"] == leader)}
+        for r in riv
+    ]
 
-    monthly_rows = rows_to_dicts(db.execute(
-        "SELECT b.name AS name, strftime('%Y-%m', s.session_date) AS ym, AVG(g.score) AS avg_score "
-        "FROM bowlers b "
-        "JOIN sessions s ON s.bowler_id=b.id "
-        "JOIN games g ON g.session_id=s.id "
-        "WHERE b.name IN ('Rajan','Medina') "
-        "GROUP BY b.name, ym "
-        "ORDER BY ym DESC"
-    ))
-    by_name = {"Rajan": {}, "Medina": {}}
-    for r in monthly_rows:
-        by_name.setdefault(r["name"], {})[r["ym"]] = round(r["avg_score"], 2) if r["avg_score"] is not None else None
+    return jsonify({"standings": standings, "league_bix_table": league_bix_table})
 
-    total_likes = db.execute("SELECT COALESCE(SUM(like_count),0) FROM games").fetchone()[0] or 0
+@app.get("/api/session/<int:sid>/games")
+def session_games(sid):
+    db = get_db()
+    s = db.execute(
+        """
+        SELECT s.session_date, b.name AS bowler, a.name AS alley, s.is_league AS is_league
+        FROM sessions s
+        JOIN bowlers b ON b.id=s.bowler_id
+        JOIN alleys a ON a.id=s.alley_id
+        WHERE s.id=?
+        """, (sid,)
+    ).fetchone()
+    games = db.execute(
+        "SELECT id, game_number, score FROM games WHERE session_id=? ORDER BY game_number",
+        (sid,)
+    ).fetchall()
 
+    scores = [g["score"] for g in games]
+    stats = {
+        "avg": (sum(scores)/len(scores)) if scores else None,
+        "low": min(scores) if scores else None,
+        "high": max(scores) if scores else None
+    }
     return jsonify({
-        "totals": totals,
-        "bix_message": bix_msg,
-        "monthly_avgs": by_name,
-        "tip_of_day": tip_for_today(),
-        "total_likes": total_likes
+        "session_date": s["session_date"] if s else None,
+        "bowler": s["bowler"] if s else None,
+        "alley": s["alley"] if s else None,
+        "is_league": int(s["is_league"]) if s and s["is_league"] is not None else 0,
+        "games": [dict(r) for r in games],
+        "stats": stats
     })
 
-# ---------- NEW: Honor Roll + Likes total ----------
-def _week_range(d: date):
-    # Monday..Sunday for the week containing d
-    start = d - timedelta(days=(d.weekday()))
+@app.post("/api/session")
+def create_session():
+    data = request.get_json(force=True)
+    bowler_id = int(data["bowler_id"])
+    alley_id = int(data["alley_id"])
+    session_date = data["session_date"]
+    is_league = 1 if bool(data.get("is_league")) else 0
+    notes = (data.get("notes") or "").strip()
+    scores = data.get("scores") or []
+    if not scores:
+        return jsonify({"error":"Enter at least one score."}), 400
+    if len(scores) > 12:
+        return jsonify({"error":"Max 12 games."}), 400
+    if any((not isinstance(s,int)) or s<1 or s>300 for s in scores):
+        return jsonify({"error":"Scores must be 1-300."}), 400
+
+    db = get_db()
+    # Allow up to two sessions per bowler per day IF one is league and one is non-league.
+    # Block only duplicates of the same type (league vs non-league).
+    exists = db.execute(
+        "SELECT id FROM sessions WHERE bowler_id=? AND session_date=? AND is_league=?",
+        (bowler_id, session_date, is_league)
+    ).fetchone()
+    if exists:
+        return jsonify({"error":"Session already exists for this bowler/date/type (league vs non-league). Edit it from Sessions."}), 400
+
+    cur = db.execute(
+        "INSERT INTO sessions(bowler_id, alley_id, session_date, is_league, notes) VALUES(?,?,?,?,?)",
+        (bowler_id, alley_id, session_date, is_league, notes)
+    )
+    sid = cur.lastrowid
+    for i, sc in enumerate(scores, start=1):
+        db.execute(
+            "INSERT INTO games(session_id, game_number, score) VALUES(?,?,?)",
+            (sid, i, int(sc))
+        )
+    db.commit()
+    return jsonify({"ok": True, "session_id": sid})
+
+@app.post("/api/sessions/<int:sid>/games")
+def add_game_to_session(sid):
+    data = request.get_json(force=True)
+    score = int(data.get("score") or 0)
+    if score < 1 or score > 300:
+        return jsonify({"error":"Score must be 1-300."}), 400
+    db = get_db()
+    cnt = db.execute("SELECT COUNT(*) AS c FROM games WHERE session_id=?", (sid,)).fetchone()["c"]
+    if cnt >= 12:
+        return jsonify({"error":"Max 12 games per session."}), 400
+    db.execute(
+        "INSERT INTO games(session_id, game_number, score) VALUES(?,?,?)",
+        (sid, cnt+1, score)
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+# ---------- Edit session meta (league vs non-league) ----------
+@app.put("/api/sessions/<int:sid>")
+def update_session(sid: int):
+    data = request.get_json(silent=True) or {}
+
+    # Allow partial updates (is_league and/or notes)
+    has_is_league = "is_league" in data
+    has_notes = "notes" in data
+    if not has_is_league and not has_notes:
+        return jsonify({"error": "Provide is_league and/or notes."}), 400
+
+    is_league = None
+    if has_is_league:
+        is_league = 1 if bool(data.get("is_league")) else 0
+
+    notes = None
+    if has_notes:
+        notes = (data.get("notes") or "").strip()
+
+    db = get_db()
+    s = db.execute(
+        "SELECT id, bowler_id, session_date, COALESCE(is_league,0) AS is_league, COALESCE(notes,'') AS notes FROM sessions WHERE id=?",
+        (sid,),
+    ).fetchone()
+    if not s:
+        return jsonify({"error": "Session not found."}), 404
+
+    # If changing league flag, prevent conflicts: (bowler_id, session_date, is_league) must remain unique
+    if has_is_league and int(s["is_league"] or 0) != is_league:
+        conflict = db.execute(
+            "SELECT id FROM sessions WHERE bowler_id=? AND session_date=? AND is_league=? AND id<>?",
+            (int(s["bowler_id"]), s["session_date"], is_league, sid),
+        ).fetchone()
+        if conflict:
+            return jsonify({"error": "Cannot change league flag: a session already exists for this bowler/date with that type."}), 400
+        db.execute("UPDATE sessions SET is_league=? WHERE id=?", (is_league, sid))
+
+    # Notes update
+    if has_notes and (s["notes"] or "") != notes:
+        db.execute("UPDATE sessions SET notes=? WHERE id=?", (notes, sid))
+
+    db.commit()
+    return jsonify({
+        "ok": True,
+        "session_id": sid,
+        "is_league": int(is_league if has_is_league else (s["is_league"] or 0)),
+        "notes": notes if has_notes else (s["notes"] or "")
+    })
+
+# ---------- Edit/Delete single game (used by modal) ----------
+@app.put("/api/games/<int:gid>")
+def update_game(gid: int):
+    data = request.get_json(silent=True) or {}
+    score = int(data.get("score") or 0)
+    if score < 1 or score > 300:
+        return jsonify({"error": "Score must be 1-300."}), 400
+    db = get_db()
+    g_row = db.execute("SELECT session_id FROM games WHERE id=?", (gid,)).fetchone()
+    if not g_row:
+        return jsonify({"error": "Game not found."}), 404
+    db.execute("UPDATE games SET score=? WHERE id=?", (score, gid))
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/games/<int:gid>")
+def delete_game(gid: int):
+    db = get_db()
+    g_row = db.execute("SELECT session_id FROM games WHERE id=?", (gid,)).fetchone()
+    if not g_row:
+        return jsonify({"error": "Game not found."}), 404
+    sid = int(g_row["session_id"])
+    db.execute("DELETE FROM games WHERE id=?", (gid,))
+    # Renumber remaining games
+    remaining = db.execute(
+        "SELECT id FROM games WHERE session_id=? ORDER BY game_number", (sid,)
+    ).fetchall()
+    for i, r in enumerate(remaining, start=1):
+        db.execute("UPDATE games SET game_number=? WHERE id=?", (i, r["id"]))
+    # If no games remain, delete the now-empty session
+    if not remaining:
+        db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+# ---------- Totals + BIX leaderboard ----------
+def compute_bix(bix_group: str, avg: float, c150: int, c210: int, c250: int, c300: int) -> float:
+    bix = avg
+    if bix_group == "A":
+        bix += 0.25 * c210
+        bix += 0.50 * c250
+        bix += 2.50 * c300
+    else:
+        bix += 0.25 * c150
+    return bix
+
+@app.get("/api/totals")
+def totals():
+    db = get_db()
+    y = str(current_year())
+
+    totals_rows = []
+    for b in db.execute("SELECT id,name,bix_group FROM bowlers ORDER BY name"):
+        row = db.execute(
+            """
+            SELECT COALESCE(COUNT(g.id),0) AS games, COALESCE(AVG(g.score),0) AS avg,
+                   COALESCE(SUM(g.score * g.score),0) AS sumsq,
+                   COALESCE(SUM(CASE WHEN g.score>=200 THEN 1 ELSE 0 END),0) AS c200,
+                   COALESCE(SUM(CASE WHEN g.score>=210 THEN 1 ELSE 0 END),0) AS c210,
+                   SUM(g.score>=250) AS c250,
+                   SUM(g.score=300)  AS c300,
+                   COALESCE(SUM(CASE WHEN g.score>=150 THEN 1 ELSE 0 END),0) AS c150
+            FROM games g
+            JOIN sessions s ON s.id=g.session_id
+            WHERE s.bowler_id=? AND strftime('%Y', s.session_date)=?
+            """, (b["id"], y),
+        ).fetchone()
+        games = row["games"] or 0
+        avg = float(row["avg"] or 0.0)
+        sumsq = float(row["sumsq"] or 0.0)
+        # Population standard deviation across all games for the year
+        if games:
+            ex2 = (sumsq / games)
+            var = ex2 - (avg * avg)
+            if var < 0 and var > -1e-9:
+                var = 0.0
+            stddev = sqrt(var) if var > 0 else 0.0
+        else:
+            stddev = 0.0
+        c150 = row["c150"] or 0
+        c200 = row["c200"] or 0
+        c210 = row["c210"] or 0
+        c250 = row["c250"] or 0
+        c300 = row["c300"] or 0
+        bix = compute_bix(b["bix_group"], avg, c150, c210, c250, c300)
+
+        # Alley breakdown
+        alleys = db.execute(
+            """
+            SELECT a.id AS alley_id, a.name AS alley,
+                   COUNT(g.id) AS games,
+                   AVG(g.score) AS avg
+            FROM games g
+            JOIN sessions s ON s.id=g.session_id
+            JOIN alleys a ON a.id=s.alley_id
+            WHERE s.bowler_id=? AND strftime('%Y', s.session_date)=?
+            GROUP BY a.id, a.name
+            ORDER BY a.name
+            """, (b["id"], y)
+        ).fetchall()
+
+        # Conversion rate (lifetime): group A tracks 200+, group B tracks 150+
+        if b["bix_group"] == "A":
+            conversion_label = "200+ Conv"
+            conversion_hits = c200
+        else:
+            conversion_label = "150+ Conv"
+            conversion_hits = c150
+
+        conversion_rate = round((conversion_hits / games) * 100, 2) if games else 0.0
+
+        totals_rows.append({
+            "bowler_id": b["id"],
+            "name": display_bowler(b["name"]),
+            "bix_group": b["bix_group"],
+            "games": games,
+            "avg": round(avg, 2),
+            "stddev": round(stddev, 2),
+            "bix": round(bix, 2),
+            "c200": c200, "c210": c210, "c150": c150,
+            "conversion_rate": conversion_rate,
+            "conversion_label": conversion_label,
+            "alleys": [{"alley_id": r["alley_id"], "alley": r["alley"], "games": r["games"], "avg": round((r["avg"] or 0),2)} for r in alleys]
+        })
+
+    # 4-bowler leaderboard (A group rivals)
+    rivals = ["Rajan","Medina","William","Edward","Larry"]
+    riv = [r for r in totals_rows if r["name"] in rivals]
+    riv.sort(key=lambda x: x["bix"], reverse=True)
+    leader_bix = riv[0]["bix"] if riv else 0.0
+    leaderboard = []
+    for r in riv:
+        leaderboard.append({
+            "name": r["name"],
+            "bix": r["bix"],
+            "diff": round(r["bix"] - leader_bix, 2),
+            "leader": (r["bix"] == leader_bix)
+        })
+
+    return jsonify({"totals": totals_rows, "bix_table": leaderboard})
+
+# ---------- Alley drilldown ----------
+@app.get("/api/bowlers/<int:bowler_id>/alleys/<int:alley_id>/games")
+def games_by_alley(bowler_id, alley_id):
+    db = get_db()
+    y = str(current_year())
+    rows = db.execute(
+        """
+        SELECT s.session_date, g.game_number, g.score
+        FROM games g
+        JOIN sessions s ON s.id=g.session_id
+        WHERE s.bowler_id=? AND s.alley_id=? AND strftime('%Y', s.session_date)=?
+        ORDER BY s.session_date DESC, g.game_number
+        """, (bowler_id, alley_id, y)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+# ---------- Honor Roll (includes special congrats for month high score) ----------
+def _date_bounds_week(today: date):
+    # week starts Monday
+    start = today - timedelta(days=today.weekday())
     end = start + timedelta(days=6)
     return start, end
 
 @app.get("/api/honor-roll")
-def api_honor_roll():
+def honor_roll():
     db = get_db()
     today = date.today()
-    wk_start, wk_end = _week_range(today)
+
+    wk_start, wk_end = _date_bounds_week(today)
     mo_start = today.replace(day=1)
-    # month end: next month minus one day
+    # month end
     if mo_start.month == 12:
-        next_month = mo_start.replace(year=mo_start.year+1, month=1, day=1)
+        mo_end = mo_start.replace(year=mo_start.year+1, month=1, day=1) - timedelta(days=1)
     else:
-        next_month = mo_start.replace(month=mo_start.month+1, day=1)
-    mo_end = next_month - timedelta(days=1)
+        mo_end = mo_start.replace(month=mo_start.month+1, day=1) - timedelta(days=1)
 
-    def fmt(d): return d.strftime("%Y-%m-%d")
+    y_start = date(today.year, 1, 1)
+    y_end = date(today.year, 12, 31)
 
-    def top_scores(d1, d2, limit=3):
+    def top_scores(d1: date, d2: date, limit: int):
         rows = db.execute(
             """
             SELECT g.score, b.name AS bowler, s.session_date, a.name AS alley
@@ -542,95 +673,283 @@ def api_honor_roll():
             WHERE s.session_date BETWEEN ? AND ?
             ORDER BY g.score DESC, s.session_date DESC
             LIMIT ?
-            """,
-            (fmt(d1), fmt(d2), limit)
+            """, (d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d"), limit)
         ).fetchall()
-        return [dict(score=r["score"], bowler=r["bowler"], session_date=r["session_date"], alley=r["alley"]) for r in rows]
+        return [dict(r) for r in rows]
 
-    def top_avgs(d1, d2, limit=3):
+    def top_avgs(d1: date, d2: date, limit: int):
         rows = db.execute(
             """
-            SELECT b.name AS bowler, ROUND(AVG(g.score),2) AS avg_score, COUNT(*) AS games
+            SELECT b.name AS bowler, COUNT(g.id) AS games, AVG(g.score) AS avg
             FROM games g
             JOIN sessions s ON s.id=g.session_id
             JOIN bowlers b ON b.id=s.bowler_id
             WHERE s.session_date BETWEEN ? AND ?
-            GROUP BY b.name
-            HAVING COUNT(*) >= 3
-            ORDER BY avg_score DESC
+            GROUP BY b.id, b.name
+            HAVING COUNT(g.id) >= 3
+            ORDER BY AVG(g.score) DESC
             LIMIT ?
-            """,
-            (fmt(d1), fmt(d2), limit)
+            """, (d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d"), limit)
         ).fetchall()
-        return [dict(bowler=r["bowler"], avg=float(r["avg_score"]), games=r["games"]) for r in rows]
+        out = []
+        for r in rows:
+            out.append({"bowler": r["bowler"], "games": r["games"], "avg": float(r["avg"])})
+        return out
 
-    # Year top score
-    y_start = today.replace(month=1, day=1)
-    y_end = today.replace(month=12, day=31)
-    yrow = db.execute(
+    week_scores = top_scores(wk_start, wk_end, 3)
+    month_scores = top_scores(mo_start, mo_end, 3)
+    year_scores = top_scores(y_start, y_end, 5)
+
+    week_avgs = top_avgs(wk_start, wk_end, 3)
+    month_avgs = top_avgs(mo_start, mo_end, 3)
+
+    monthly_champion = month_scores[0] if month_scores else None
+
+    return jsonify({
+        "week": {"range": [wk_start.strftime("%Y-%m-%d"), wk_end.strftime("%Y-%m-%d")], "top_scores": week_scores, "top_avgs": week_avgs},
+        "month": {"range": [mo_start.strftime("%Y-%m-%d"), mo_end.strftime("%Y-%m-%d")], "top_scores": month_scores, "top_avgs": month_avgs},
+        "year": {"range": [y_start.strftime("%Y-%m-%d"), y_end.strftime("%Y-%m-%d")], "top_scores": year_scores},
+        "months": [],  # keep shape compatible with older JS
+        "monthly_champion": monthly_champion
+    })
+
+# ---------- High Scores (week/month/year/all-time) ----------
+@app.get("/api/high-scores")
+def high_scores():
+    db = get_db()
+    today = date.today()
+
+    wk_start, wk_end = _date_bounds_week(today)
+    mo_start = today.replace(day=1)
+    if mo_start.month == 12:
+        mo_end = mo_start.replace(year=mo_start.year+1, month=1, day=1) - timedelta(days=1)
+    else:
+        mo_end = mo_start.replace(month=mo_start.month+1, day=1) - timedelta(days=1)
+
+    y_start = date(today.year, 1, 1)
+    y_end = date(today.year, 12, 31)
+
+    def best_between(d1: date, d2: date, league_only: bool = False):
+        where = "s.session_date BETWEEN ? AND ?"
+        params = [d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d")]
+        if league_only:
+            where += " AND COALESCE(s.is_league,0)=1"
+        r = db.execute(
+            f"""
+            SELECT g.score, b.name AS bowler, s.session_date, a.name AS alley
+            FROM games g
+            JOIN sessions s ON s.id=g.session_id
+            JOIN bowlers b ON b.id=s.bowler_id
+            JOIN alleys a ON a.id=s.alley_id
+            WHERE {where}
+            ORDER BY g.score DESC, s.session_date DESC
+            LIMIT 1
+            """, tuple(params)
+        ).fetchone()
+        return dict(r) if r else None
+
+    def best_all_time():
+        r = db.execute(
+            """
+            SELECT g.score, b.name AS bowler, s.session_date, a.name AS alley
+            FROM games g
+            JOIN sessions s ON s.id=g.session_id
+            JOIN bowlers b ON b.id=s.bowler_id
+            JOIN alleys a ON a.id=s.alley_id
+            ORDER BY g.score DESC, s.session_date DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return dict(r) if r else None
+
+    return jsonify({
+        "week": {"range": [wk_start.strftime("%Y-%m-%d"), wk_end.strftime("%Y-%m-%d")], "best": best_between(wk_start, wk_end)},
+        "month": {"range": [mo_start.strftime("%Y-%m-%d"), mo_end.strftime("%Y-%m-%d")], "best": best_between(mo_start, mo_end)},
+        "year": {"range": [y_start.strftime("%Y-%m-%d"), y_end.strftime("%Y-%m-%d")], "best": best_between(y_start, y_end)},
+        "league_year": {"range": [y_start.strftime("%Y-%m-%d"), y_end.strftime("%Y-%m-%d")], "best": best_between(y_start, y_end, league_only=True)},
+        "all_time": {"best": best_all_time()}
+    })
+
+
+
+# ---------- Historical (all years) ----------
+@app.get("/api/monthly-averages")
+def monthly_averages():
+    """Return per-bowler monthly averages for a given year (defaults to current year).
+    Query params:
+      - year=YYYY (optional)
+      - league_only=1 (optional; only if sessions.is_league exists, otherwise ignored)
+      - bowler_id=<int> (optional; when provided, returns only that bowler)
+    """
+    db = get_db()
+    year = request.args.get("year") or str(current_year())
+    league_only = str(request.args.get("league_only", "")).lower() in ("1","true","yes","y")
+    bowler_id = request.args.get("bowler_id")
+
+    # If schema doesn't have is_league, ignore league_only safely
+    cols = [r["name"] for r in db.execute("PRAGMA table_info(sessions)").fetchall()]
+    has_is_league = "is_league" in cols
+
+    where = ["strftime('%Y', s.session_date)=?"]
+    params = [year]
+    if league_only and has_is_league:
+        where.append("COALESCE(s.is_league,0)=1")
+    if bowler_id:
+        try:
+            bid = int(bowler_id)
+        except ValueError:
+            return jsonify({"error": "Invalid bowler_id"}), 400
+        where.append("s.bowler_id=?")
+        params.append(bid)
+
+    where_sql = " AND ".join(where)
+
+    rows = db.execute(
+        f"""
+        SELECT
+            b.id   AS bowler_id,
+            b.name AS bowler,
+            CAST(strftime('%m', s.session_date) AS INTEGER) AS month,
+            COUNT(g.id) AS games,
+            AVG(g.score) AS avg_score
+        FROM sessions s
+        JOIN games g   ON g.session_id = s.id
+        JOIN bowlers b ON b.id = s.bowler_id
+        WHERE {where_sql}
+        GROUP BY b.id, b.name, month
+        ORDER BY b.name, month
+        """,
+        params
+    ).fetchall()
+
+    # Shape: one row per bowler with months 1..12 filled or null
+    by_bowler = {}
+    for r in rows:
+        bid = r["bowler_id"]
+        if bid not in by_bowler:
+            by_bowler[bid] = {
+                "bowler_id": bid,
+                "name": display_bowler(r["bowler"]),
+                "months": {m: None for m in range(1,13)},
+                "month_games": {m: 0 for m in range(1,13)},
+            }
+        m = int(r["month"])
+        by_bowler[bid]["months"][m] = round(float(r["avg_score"] or 0.0), 2) if r["games"] else None
+        by_bowler[bid]["month_games"][m] = int(r["games"] or 0)
+
+    # Add YTD
+    out = []
+    for rec in by_bowler.values():
+        total_games = sum(rec["month_games"].values())
+        if total_games:
+            # weighted avg
+            weighted = 0.0
+            for m in range(1,13):
+                if rec["months"][m] is None:
+                    continue
+                weighted += rec["months"][m] * rec["month_games"][m]
+            ytd = round(weighted / total_games, 2)
+        else:
+            ytd = None
+        rec["ytd_games"] = total_games
+        rec["ytd_avg"] = ytd
+        out.append(rec)
+
+    # Ensure bowlers with zero games still appear ONLY when not filtering to a single bowler.
+    # When bowler_id is provided, return only that bowler (even if they have zero games).
+    if not bowler_id:
+        existing_ids = {r["bowler_id"] for r in out}
+        for b in db.execute("SELECT id,name FROM bowlers ORDER BY name").fetchall():
+            if b["id"] not in existing_ids:
+                out.append({
+                    "bowler_id": b["id"],
+                    "name": display_bowler(b["name"]),
+                    "months": {m: None for m in range(1,13)},
+                    "month_games": {m: 0 for m in range(1,13)},
+                    "ytd_games": 0,
+                    "ytd_avg": None
+                })
+    else:
+        # If filtered and there are no rows, still return the selected bowler stub.
+        if not out:
+            b = db.execute("SELECT id,name FROM bowlers WHERE id=?", (bid,)).fetchone()
+            if b is None:
+                return jsonify({"error": "Bowler not found"}), 404
+            out = [{
+                "bowler_id": b["id"],
+                "name": display_bowler(b["name"]),
+                "months": {m: None for m in range(1,13)},
+                "month_games": {m: 0 for m in range(1,13)},
+                "ytd_games": 0,
+                "ytd_avg": None
+            }]
+
+    out.sort(key=lambda x: x["name"])
+    return jsonify({"year": int(year), "league_only": bool(league_only and has_is_league), "rows": out})
+
+@app.get("/api/history")
+def history():
+    """
+    Returns historical averages by year for each bowler.
+
+    Shape expected by frontend:
+      {
+        "years": ["2023","2024","2025"],
+        "data": {
+          "Rajan": {"2024": {"avg": 201.25, "games": 48}, ...},
+          ...
+        }
+      }
+    """
+    db = get_db()
+
+    # Determine which years exist in the data
+    years = [r["y"] for r in db.execute(
+        "SELECT DISTINCT strftime('%Y', session_date) AS y FROM sessions ORDER BY y"
+    ).fetchall() if r["y"]]
+
+    # If no sessions yet, keep stable shape
+    if not years:
+        return jsonify({"years": [], "data": {}})
+
+    # Pull aggregated stats for all bowlers + years
+    rows = db.execute(
         """
-        SELECT g.score, b.name AS bowler, s.session_date, a.name AS alley
+        SELECT b.name AS bowler,
+               strftime('%Y', s.session_date) AS y,
+               COUNT(g.id) AS games,
+               AVG(g.score) AS avg
         FROM games g
         JOIN sessions s ON s.id=g.session_id
         JOIN bowlers b ON b.id=s.bowler_id
-        JOIN alleys a ON a.id=s.alley_id
-        WHERE s.session_date BETWEEN ? AND ?
-        ORDER BY g.score DESC, s.session_date DESC
-        LIMIT 1
-        """,
-        (fmt(y_start), fmt(y_end))
-    ).fetchone()
-    year_top = None
-    if yrow:
-        year_top = {
-            "score": yrow["score"],
-            "bowler": yrow["bowler"],
-            "session_date": yrow["session_date"],
-            "alley": yrow["alley"],
+        GROUP BY b.id, b.name, y
+        ORDER BY b.name, y
+        """
+    ).fetchall()
+
+    data = {}
+    for r in rows:
+        bowler = r["bowler"]
+        y = r["y"]
+        data.setdefault(bowler, {})
+        data[bowler][y] = {
+            "avg": round(float(r["avg"] or 0.0), 2),
+            "games": int(r["games"] or 0)
         }
 
+    return jsonify({"years": years, "data": data})
+
+
+# ---------- Debug diag ----------
+@app.get("/api/debug/diag")
+def debug_diag():
+    db = get_db()
     return jsonify({
-        "week": {
-            "range": [fmt(wk_start), fmt(wk_end)],
-            "top_scores": top_scores(wk_start, wk_end),
-            "top_avgs": top_avgs(wk_start, wk_end),
-        },
-        "month": {
-            "range": [fmt(mo_start), fmt(mo_end)],
-            "top_scores": top_scores(mo_start, mo_end),
-            "top_avgs": top_avgs(mo_start, mo_end),
-        },
-        "year": {
-            "top_score": year_top
-        }
+        "db_path": DB_PATH,
+        "cwd": os.getcwd(),
+        "file": os.path.abspath(__file__),
+        "tables": [r["name"] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
     })
 
-@app.get("/api/likes/total")
-def api_likes_total():
-    db = get_db()
-    total = db.execute("SELECT COALESCE(SUM(like_count),0) FROM games").fetchone()[0] or 0
-    return jsonify({"total_likes": int(total)})
-
-# ---------- Debug ----------
-@app.get("/api/debug/diag")
-def api_debug_diag():
-    db = get_db()
-    def cols(t):
-        return [dict(r) for r in db.execute(f"PRAGMA table_info({t})").fetchall()]
-    return jsonify(
-        {
-            "db_path": DB_PATH,
-            "exists": os.path.exists(DB_PATH),
-            "tables": {
-                "games": cols("games"),
-                "sessions": cols("sessions"),
-                "bowlers": cols("bowlers"),
-                "alleys": cols("alleys"),
-                "game_reactions": cols("game_reactions"),
-            },
-        }
-    )
-
-# ---------- Run ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
